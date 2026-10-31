@@ -7,7 +7,7 @@ use std::f32::consts::PI;
 use crate::app::{Dragging, EditMode, HudApp};
 use crate::barrier::Barrier;
 use crate::field::{FieldView, FIELD_CM, TILE_CM};
-use crate::segment::{HeadingMode, Segment};
+use crate::segment::Segment;
 
 const WAYPOINT_RADIUS: f32 = 12.0;
 /// Margine di esclusione intorno alle barriere: metà robot + 1 cm di errore
@@ -18,7 +18,7 @@ const HIT_EXTRA: f32 = 8.0;
 const ROBOT_SIZE_CM: f32 = 45.0;
 
 pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
-    egui::CentralPanel::default().show(ui, |ui| {
+    {
         let avail = ui.available_size();
         let side = avail.x.min(avail.y);
         let (response, painter) =
@@ -28,11 +28,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         draw_field(&painter, &field, app);
         handle_input(&response, &field, app, ui.ctx());
         draw_path(&painter, &field, app);
+        draw_brake_points(&painter, &field, app);
         draw_barriers(&painter, &field, app);
         draw_barrier_exclusion_zones(&painter, &field, app);
         draw_robot(&painter, &field, app);
         draw_mouse_coords(&painter, &response, &field);
-    });
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -57,6 +58,8 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                 app.dragging = Dragging::ControlPoint(si, ci);
             } else if let Some(ni) = waypoint_at(pos, field, app) {
                 app.dragging = Dragging::Node(ni);
+            } else if let Some(si) = brake_point_at(pos, field, app) {
+                app.dragging = Dragging::BrakePoint(si);
             } else if let Some((bi, vi)) = barrier_vertex_at(pos, field, app) {
                 app.dragging = Dragging::BarrierVertex(bi, vi);
             } else if let Some(bi) = barrier_body_at(pos, field, app) {
@@ -98,6 +101,17 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                         }
                     }
                 }
+                Dragging::BrakePoint(si) => {
+                    // Calcola il t più vicino al punto del mouse sul segmento
+                    if let Some(seg) = app.segments.get(si) {
+                        let from = if si == 0 { app.start } else { app.segments[si-1].end() };
+                        let pts = seg.sample(from, 80);
+                        let t = closest_t_on_path(&pts, field, pos);
+                        if let Some(opts) = app.segments.get_mut(si).map(|s| s.opts_mut()) {
+                            opts.speed.brake_point = t.clamp(0.1, 0.99);
+                        }
+                    }
+                }
                 Dragging::Barrier(bi) => {
                     if let Some(b) = app.barriers.get_mut(bi) {
                         b.translate(delta_cm[0], delta_cm[1]);
@@ -116,6 +130,35 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
     }
 
     if response.drag_stopped() {
+        // Se il punto finale è bloccato, rimanda l'elemento alla posizione più vicina valida.
+        // Per semplicità: se è bloccato lo lasciamo dove era prima (il clamp nel drag
+        // lo ha già tenuto nel campo; qui ricontrolliamo le barriere).
+        match &app.dragging {
+            Dragging::Node(0) => {
+                if point_blocked_by_barrier(app.start, app) {
+                    // cerca la posizione valida più vicina lungo la normale
+                    // Per ora: snap al bordo della exclusion zone (push_out)
+                    // Importiamo direttamente la logica da barrier
+                    use crate::barrier::push_out_of_barriers;
+                    app.start = push_out_of_barriers(app.start, &app.barriers, EXCLUSION_CM);
+                }
+            }
+            Dragging::Node(i) => {
+                let i = *i;
+                if i > 0 && i <= app.segments.len() {
+                    let end = app.segments[i-1].end();
+                    if point_blocked_by_barrier(end, app) {
+                        use crate::barrier::push_out_of_barriers;
+                        let fixed = push_out_of_barriers(end, &app.barriers, EXCLUSION_CM);
+                        match &mut app.segments[i-1] {
+                            Segment::Line { to, .. } => *to = fixed,
+                            Segment::Curve { to, .. } => *to = fixed,
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         app.dragging = Dragging::Nothing;
     }
 
@@ -131,34 +174,38 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                 || barrier_vertex_at(pos, field, app).is_some();
 
             if !on_existing {
+                let blocked = point_blocked_by_barrier(clamped, app);
                 match app.mode {
                     EditMode::AddLine => {
-                        app.segments.push(Segment::Line {
-                            to: clamped,
-                            heading: HeadingMode::Tangent,
-                        });
+                        if !blocked {
+                            app.segments.push(Segment::Line {
+                                to: clamped,
+                                opts: Default::default(),
+                            });
+                        }
                     }
                     EditMode::AddCurve => {
-                        let prev = last_point(app);
-                        let ctrl = [
-                            (prev[0] + clamped[0]) / 2.0,
-                            (prev[1] + clamped[1]) / 2.0 + 30.0,
-                        ];
-                        app.segments.push(Segment::Curve {
-                            controls: vec![ctrl],
-                            to: clamped,
-                            heading: HeadingMode::Tangent,
-                        });
+                        if !blocked {
+                            let prev = last_point(app);
+                            let ctrl = [
+                                (prev[0] + clamped[0]) / 2.0,
+                                (prev[1] + clamped[1]) / 2.0 + 30.0,
+                            ];
+                            app.segments.push(Segment::Curve {
+                                controls: vec![ctrl],
+                                to: clamped,
+                                opts: Default::default(),
+                            });
+                        }
                     }
                     EditMode::AddBarrier => {
-                        // Se c'è una barriera aperta in cima, aggiungi vertice lì
+                        // Per le barriere il check non si applica (stai costruendo la barriera stessa)
                         if let Some(b) = app.barriers.last_mut() {
                             if !b.closed {
                                 b.vertices.push(clamped);
                                 return;
                             }
                         }
-                        // Altrimenti inizia una nuova barriera
                         let mut b = Barrier::new();
                         b.vertices.push(clamped);
                         app.barriers.push(b);
@@ -400,7 +447,7 @@ fn draw_path(painter: &Painter, field: &FieldView, app: &HudApp) {
         for w in pts.windows(2) {
             painter.line_segment(
                 [field.to_screen(w[0]), field.to_screen(w[1])],
-                Stroke::new(2.5, Color32::LIGHT_BLUE),
+                Stroke::new(2.5, Color32::from_rgb(100, 180, 255)),
             );
         }
 
@@ -464,7 +511,7 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
     painter.add(egui::Shape::convex_polygon(
         corners,
         Color32::from_rgba_unmultiplied(0, 220, 220, 120),
-        Stroke::new(2.0, Color32::CYAN),
+        Stroke::new(2.0, Color32::from_rgb(0, 255, 255)),
     ));
 
     let front = rotate(0.0, -half * 0.8);
@@ -476,7 +523,7 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
         Align2::LEFT_CENTER,
         format!("{:.0}°", app.robot_heading),
         FontId::proportional(11.0),
-        Color32::CYAN,
+        Color32::from_rgb(0, 255, 255),
     );
 }
 
@@ -563,6 +610,42 @@ fn point_in_polygon(p: Pos2, poly: &[Pos2]) -> bool {
     inside
 }
 
+/// Controlla se un punto in coordinate campo [cm] cade dentro o troppo vicino
+/// a qualsiasi barriera chiusa (distanza < EXCLUSION_CM dai lati).
+fn point_blocked_by_barrier(p: [f32; 2], app: &HudApp) -> bool {
+    use crate::barrier::{dist_point_to_segment, min_dist_to_barriers};
+    for b in &app.barriers {
+        if !b.closed || b.vertices.len() < 3 { continue; }
+        // Dentro al poligono?
+        let verts: Vec<[f32;2]> = b.vertices.clone();
+        if point_in_polygon_field(p, &verts) { return true; }
+        // Troppo vicino ai lati?
+        let d = b.edges().iter()
+            .map(|(a, bb)| dist_point_to_segment(p, *a, *bb))
+            .fold(f32::INFINITY, f32::min);
+        if d < EXCLUSION_CM { return true; }
+    }
+    false
+}
+
+/// Ray-casting in coordinate campo (y non invertita).
+fn point_in_polygon_field(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = poly[i];
+        let pj = poly[j];
+        if ((pi[1] > p[1]) != (pj[1] > p[1]))
+            && (p[0] < (pj[0] - pi[0]) * (p[1] - pi[1]) / (pj[1] - pi[1]) + pi[0])
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 fn is_near_robot(pos: Pos2, field: &FieldView, app: &HudApp) -> bool {
     let center = field.to_screen(app.robot_pos);
     let scale = field.rect.width() / FIELD_CM;
@@ -573,6 +656,76 @@ fn is_near_robot(pos: Pos2, field: &FieldView, app: &HudApp) -> bool {
 // ════════════════════════════════════════════════════════════
 // Utility
 // ════════════════════════════════════════════════════════════
+
+/// Disegna il punto di inizio frenata per ogni segmento.
+fn draw_brake_points(painter: &Painter, field: &FieldView, app: &HudApp) {
+    let mut prev = app.start;
+    for (i, seg) in app.segments.iter().enumerate() {
+        let pts = seg.sample(prev, 80);
+        let t   = seg.opts().speed.brake_point;
+        let bp  = sample_at_t_field(&pts, t);
+        let sp  = field.to_screen(bp);
+
+        // Triangolino verso il basso = punto di frenata
+        let r = 7.0_f32;
+        let tri = vec![
+            Pos2::new(sp.x, sp.y + r),
+            Pos2::new(sp.x - r * 0.866, sp.y - r * 0.5),
+            Pos2::new(sp.x + r * 0.866, sp.y - r * 0.5),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            tri,
+            Color32::from_rgb(255, 80, 80),
+            Stroke::new(1.5, Color32::WHITE),
+        ));
+        painter.text(
+            sp + Vec2::new(10.0, 0.0),
+            Align2::LEFT_CENTER,
+            format!("t={:.2}", t),
+            FontId::proportional(10.0),
+            Color32::from_rgb(255, 150, 150),
+        );
+        prev = seg.end();
+    }
+}
+
+fn sample_at_t_field(pts: &[[f32; 2]], t: f32) -> [f32; 2] {
+    let n = pts.len() - 1;
+    let idx = ((t * n as f32) as usize).min(n);
+    pts[idx]
+}
+
+/// Ritorna il t ∈ [0,1] del punto più vicino a `pos` sulla polilinea campionata.
+fn closest_t_on_path(pts: &[[f32; 2]], field: &FieldView, pos: Pos2) -> f32 {
+    let n = pts.len();
+    let mut best_t = 0.0_f32;
+    let mut best_d = f32::INFINITY;
+    for (i, p) in pts.iter().enumerate() {
+        let sp = field.to_screen(*p);
+        let d  = sp.distance(pos);
+        if d < best_d {
+            best_d = d;
+            best_t = i as f32 / (n - 1) as f32;
+        }
+    }
+    best_t
+}
+
+/// Hit-test sul triangolino del brake_point.
+fn brake_point_at(pos: Pos2, field: &FieldView, app: &HudApp) -> Option<usize> {
+    let mut prev = app.start;
+    for (i, seg) in app.segments.iter().enumerate() {
+        let pts = seg.sample(prev, 80);
+        let t   = seg.opts().speed.brake_point;
+        let bp  = sample_at_t_field(&pts, t);
+        let sp  = field.to_screen(bp);
+        if sp.distance(pos) <= 12.0 {
+            return Some(i);
+        }
+        prev = seg.end();
+    }
+    None
+}
 
 fn clamp_field(fp: [f32; 2]) -> [f32; 2] {
     [fp[0].clamp(0.0, FIELD_CM), fp[1].clamp(0.0, FIELD_CM)]

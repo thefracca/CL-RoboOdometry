@@ -1,70 +1,125 @@
-// Tipi di segmento del percorso.
-// Un Line è un segmento dritto da un punto a un altro.
-// Un Curve è una Bezier cubica: "controls" sono i punti di controllo
-// intermedi che l'utente sposta per piegare la curva.
-
-#[derive(Clone, Debug)]
-pub enum Segment {
-    Line {
-        to: [f32; 2],
-        heading: HeadingMode,
-    },
-    Curve {
-        /// Punti di controllo Bezier: il primo e l'ultimo sono i "manici"
-        /// che l'utente trascina perpendicolarmente alla retta.
-        controls: Vec<[f32; 2]>,
-        to: [f32; 2],
-        heading: HeadingMode,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeadingMode {
-    Tangent,        // il robot punta nella direzione di moto
-    Fixed(f32),     // angolo fisso in gradi (0 = destra, 90 = su)
+    Tangent,
+    Fixed(f32),
 }
 
 impl Default for HeadingMode {
     fn default() -> Self { HeadingMode::Tangent }
 }
 
-impl Segment {
-    /// Punto di arrivo del segmento.
-    pub fn end(&self) -> [f32; 2] {
-        match self {
-            Segment::Line { to, .. } => *to,
-            Segment::Curve { to, .. } => *to,
+#[derive(Clone, Debug, PartialEq)]
+pub enum RobotAction {
+    Move,
+    Shoot(f32), // attendi N secondi
+}
+
+impl Default for RobotAction {
+    fn default() -> Self { RobotAction::Move }
+}
+
+/// Profilo di velocità per un segmento.
+#[derive(Clone, Debug)]
+pub struct SpeedProfile {
+    pub v_start:     f32,  // cm/s — velocità iniziale
+    pub v_max:       f32,  // cm/s — velocità massima
+    pub accel:       f32,  // cm/s² — accelerazione
+    pub decel:       f32,  // cm/s² — decelerazione
+    /// t ∈ [0,1] — dove inizia la frenata sul segmento
+    pub brake_point: f32,
+}
+
+impl Default for SpeedProfile {
+    fn default() -> Self {
+        Self { v_start: 0.0, v_max: 80.0, accel: 120.0, decel: 200.0, brake_point: 0.75 }
+    }
+}
+
+impl SpeedProfile {
+    /// Velocità istantanea dato t ∈ [0,1] e la lunghezza del segmento.
+    /// Fase 1: accelera da v_start verso v_max
+    /// Fase 2: viaggia a v_max
+    /// Fase 3: da brake_point decelera verso 0
+    pub fn velocity_at(&self, t: f32, _seg_len: f32) -> f32 {
+        let bp = self.brake_point.clamp(0.01, 0.99);
+
+        if t >= bp {
+            // Fase frenata: decelera linearmente da v_max a 0
+            let frac = (t - bp) / (1.0 - bp);
+            (self.v_max * (1.0 - frac)).max(1.0)
+        } else {
+            // Fase accelerazione: da v_start a v_max
+            let frac = t / bp;
+            (self.v_start + (self.v_max - self.v_start) * frac).max(1.0)
         }
     }
+}
 
-    /// Campiona la curva Bezier cubica in `n` punti per disegnarla.
-    /// Per un Line restituisce solo start e end.
+#[derive(Clone, Debug)]
+pub struct SegmentOptions {
+    pub heading:  HeadingMode,
+    pub speed:    SpeedProfile,
+    pub action:   RobotAction,
+    pub intake:   bool,
+    pub flywheel: bool,
+}
+
+impl Default for SegmentOptions {
+    fn default() -> Self {
+        Self {
+            heading:  HeadingMode::default(),
+            speed:    SpeedProfile::default(),
+            action:   RobotAction::default(),
+            intake:   false,
+            flywheel: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Segment {
+    Line  { to: [f32; 2], opts: SegmentOptions },
+    Curve { controls: Vec<[f32; 2]>, to: [f32; 2], opts: SegmentOptions },
+}
+
+impl Segment {
+    pub fn end(&self) -> [f32; 2] {
+        match self { Segment::Line { to, .. } | Segment::Curve { to, .. } => *to }
+    }
+
+    pub fn opts(&self) -> &SegmentOptions {
+        match self { Segment::Line { opts, .. } | Segment::Curve { opts, .. } => opts }
+    }
+
+    pub fn opts_mut(&mut self) -> &mut SegmentOptions {
+        match self { Segment::Line { opts, .. } | Segment::Curve { opts, .. } => opts }
+    }
+
+    /// Campiona il segmento in n punti uniformi in t — anche le linee
+    /// vengono campionate densamente per avere movimento fluido.
     pub fn sample(&self, from: [f32; 2], n: usize) -> Vec<[f32; 2]> {
         match self {
-            Segment::Line { to, .. } => vec![from, *to],
+            Segment::Line { to, .. } => {
+                (0..=n).map(|i| {
+                    let t = i as f32 / n as f32;
+                    [from[0] + t * (to[0] - from[0]),
+                     from[1] + t * (to[1] - from[1])]
+                }).collect()
+            }
             Segment::Curve { controls, to, .. } => {
-                // Bezier cubica: p0=from, p1=controls[0], p2=controls[last], p3=to
-                // Se c'è un solo control point lo usiamo sia come p1 che come p2.
                 let p0 = from;
-                let (p1, p2) = if controls.is_empty() {
-                    (from, *to)
-                } else if controls.len() == 1 {
-                    (controls[0], controls[0])
-                } else {
-                    (controls[0], controls[controls.len() - 1])
+                let (p1, p2) = match controls.len() {
+                    0 => (from, *to),
+                    1 => (controls[0], controls[0]),
+                    _ => (controls[0], controls[controls.len() - 1]),
                 };
                 let p3 = *to;
-
-                (0..=n)
-                    .map(|i| {
-                        let t = i as f32 / n as f32;
-                        let u = 1.0 - t;
-                        [
-                            u*u*u*p0[0] + 3.0*u*u*t*p1[0] + 3.0*u*t*t*p2[0] + t*t*t*p3[0],
-                            u*u*u*p0[1] + 3.0*u*u*t*p1[1] + 3.0*u*t*t*p2[1] + t*t*t*p3[1],
-                        ]
-                    })
-                    .collect()
+                (0..=n).map(|i| {
+                    let t = i as f32 / n as f32;
+                    let u = 1.0 - t;
+                    [u*u*u*p0[0] + 3.0*u*u*t*p1[0] + 3.0*u*t*t*p2[0] + t*t*t*p3[0],
+                     u*u*u*p0[1] + 3.0*u*u*t*p1[1] + 3.0*u*t*t*p2[1] + t*t*t*p3[1]]
+                }).collect()
             }
         }
     }
