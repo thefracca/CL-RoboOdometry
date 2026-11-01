@@ -11,7 +11,9 @@ impl Default for HeadingMode {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RobotAction {
     Move,
-    Shoot(f32), // attendi N secondi
+    Wait(f32),       // attendi N secondi fermo (senza sparare)
+    ShootStop(f32),  // spara fermo per N secondi
+    ShootMove(f32),  // spara mentre si muove
 }
 
 impl Default for RobotAction {
@@ -57,21 +59,28 @@ impl SpeedProfile {
 
 #[derive(Clone, Debug)]
 pub struct SegmentOptions {
-    pub heading:  HeadingMode,
-    pub speed:    SpeedProfile,
-    pub action:   RobotAction,
-    pub intake:   bool,
-    pub flywheel: bool,
+    pub heading:       HeadingMode,
+    pub speed:         SpeedProfile,
+    pub action:        RobotAction,
+    pub intake:        bool,
+    pub flywheel:      bool,
+    /// Heading del robot (dove guarda) all'inizio del segmento, in gradi.
+    /// Indipendente dalla direzione di movimento (mecanum).
+    pub robot_heading_start: f32,
+    /// Heading del robot alla fine del segmento. Viene interpolato linearmente.
+    pub robot_heading_end:   f32,
 }
 
 impl Default for SegmentOptions {
     fn default() -> Self {
         Self {
-            heading:  HeadingMode::default(),
-            speed:    SpeedProfile::default(),
-            action:   RobotAction::default(),
-            intake:   false,
-            flywheel: false,
+            heading:             HeadingMode::default(),
+            speed:               SpeedProfile::default(),
+            action:              RobotAction::default(),
+            intake:              false,
+            flywheel:            false,
+            robot_heading_start: 90.0,
+            robot_heading_end:   90.0,
         }
     }
 }

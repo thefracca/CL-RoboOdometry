@@ -31,6 +31,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         draw_brake_points(&painter, &field, app);
         draw_barriers(&painter, &field, app);
         draw_barrier_exclusion_zones(&painter, &field, app);
+        draw_preview(&painter, &field, app, response.hover_pos());
         draw_robot(&painter, &field, app);
         draw_mouse_coords(&painter, &response, &field);
     }
@@ -178,10 +179,13 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                 match app.mode {
                     EditMode::AddLine => {
                         if !blocked {
-                            app.segments.push(Segment::Line {
-                                to: clamped,
-                                opts: Default::default(),
-                            });
+                            let mut opts = crate::segment::SegmentOptions::default();
+                            // Continua dall'heading finale del segmento precedente
+                            if let Some(prev_seg) = app.segments.last() {
+                                opts.robot_heading_start = prev_seg.opts().robot_heading_end;
+                                opts.robot_heading_end   = prev_seg.opts().robot_heading_end;
+                            }
+                            app.segments.push(Segment::Line { to: clamped, opts });
                         }
                     }
                     EditMode::AddCurve => {
@@ -191,10 +195,15 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                                 (prev[0] + clamped[0]) / 2.0,
                                 (prev[1] + clamped[1]) / 2.0 + 30.0,
                             ];
+                            let mut opts = crate::segment::SegmentOptions::default();
+                            if let Some(prev_seg) = app.segments.last() {
+                                opts.robot_heading_start = prev_seg.opts().robot_heading_end;
+                                opts.robot_heading_end   = prev_seg.opts().robot_heading_end;
+                            }
                             app.segments.push(Segment::Curve {
                                 controls: vec![ctrl],
                                 to: clamped,
-                                opts: Default::default(),
+                                opts,
                             });
                         }
                     }
@@ -224,19 +233,37 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
 
             match app.mode {
                 EditMode::AddBarrier => {
-                    // Chiudi la barriera aperta
                     if let Some(b) = app.barriers.last_mut() {
                         if !b.closed && b.vertices.len() >= 3 {
                             b.closed = true;
                         }
                     }
                 }
-                EditMode::AddCurve => {
-                    // Aggiungi control point extra alla prima curva trovata
-                    for seg in app.segments.iter_mut() {
-                        if let Segment::Curve { controls, .. } = seg {
-                            controls.push(clamped);
-                            break;
+                // In Select o AddCurve: aggiunge control point alla curva più vicina
+                EditMode::Select | EditMode::AddCurve => {
+                    let mut best_si: Option<usize> = None;
+                    let mut best_dist = f32::INFINITY;
+                    let mut prev = app.start;
+                    for (si, seg) in app.segments.iter().enumerate() {
+                        if matches!(seg, Segment::Curve { .. }) {
+                            // Distanza dal click al percorso campionato
+                            let pts = seg.sample(prev, 40);
+                            let d = pts.iter()
+                                .map(|p| field.to_screen(*p).distance(pos))
+                                .fold(f32::INFINITY, f32::min);
+                            if d < best_dist {
+                                best_dist = d;
+                                best_si = Some(si);
+                            }
+                        }
+                        prev = seg.end();
+                    }
+                    // Solo se abbastanza vicino (30px) e non bloccato
+                    if let Some(si) = best_si {
+                        if best_dist < 30.0 && !point_blocked_by_barrier(clamped, app) {
+                            if let Segment::Curve { controls, .. } = &mut app.segments[si] {
+                                controls.push(clamped);
+                            }
                         }
                     }
                 }
@@ -269,9 +296,15 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                                 controls.remove(ci);
                             }
                         }
-                    } else if let Some((bi, _)) = barrier_vertex_at(pos, field, app) {
-                        // Tasto destro su vertice barriera in Select = elimina tutta la barriera
-                        app.barriers.remove(bi);
+                    } else if let Some((bi, vi)) = barrier_vertex_at(pos, field, app) {
+                        let b = &mut app.barriers[bi];
+                        b.vertices.remove(vi);
+                        // Se era chiusa la riapre, se rimane vuota la elimina
+                        if b.vertices.is_empty() {
+                            app.barriers.remove(bi);
+                        } else {
+                            b.closed = false; // torna aperta così puoi continuare
+                        }
                     }
                 }
             }
@@ -363,6 +396,26 @@ fn draw_field(painter: &Painter, field: &FieldView, app: &HudApp) {
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
         );
+    }
+
+    // Linee gialle di esclusione dai bordi del campo — sempre visibili
+    {
+        let m = EXCLUSION_CM;
+        let dash_stroke = Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 230, 0, 180));
+        let corners = [
+            ([m, m],              [FIELD_CM - m, m]),
+            ([FIELD_CM - m, m],   [FIELD_CM - m, FIELD_CM - m]),
+            ([FIELD_CM - m, FIELD_CM - m], [m, FIELD_CM - m]),
+            ([m, FIELD_CM - m],   [m, m]),
+        ];
+        for (a, b) in corners {
+            draw_dashed_line(
+                painter,
+                field.to_screen(a),
+                field.to_screen(b),
+                6.0, 4.0, dash_stroke,
+            );
+        }
     }
 
     if app.hide_grid { return; }
@@ -514,17 +567,120 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
         Stroke::new(2.0, Color32::from_rgb(0, 255, 255)),
     ));
 
+    // Freccia bianca = dove guarda il robot (heading)
     let front = rotate(0.0, -half * 0.8);
     painter.arrow(center, front - center, Stroke::new(2.5, Color32::WHITE));
+
+    // Freccia verde = direzione di movimento (tangente al percorso)
+    // Visibile solo durante la simulazione quando heading ≠ travel dir
+    if app.sim.is_running() {
+        if let Some(seg) = app.segments.get(app.sim.seg_index.min(app.segments.len().saturating_sub(1))) {
+            let from = if app.sim.seg_index == 0 { app.start }
+                       else { app.segments[app.sim.seg_index.saturating_sub(1)].end() };
+            let pts = seg.sample(from, 80);
+            let travel_deg = tangent_at_field(&pts, app.sim.t);
+            let travel_rad = -(travel_deg - 90.0) * PI / 180.0;
+            let travel_dir = Vec2::new(travel_rad.cos(), travel_rad.sin());
+            let travel_tip = center + travel_dir * half * 0.8;
+            painter.arrow(center, travel_tip - center,
+                Stroke::new(2.0, Color32::from_rgb(0, 220, 80)));
+        }
+    }
 
     painter.text(center, Align2::CENTER_CENTER, "R", FontId::proportional(13.0), Color32::WHITE);
     painter.text(
         center + Vec2::new(half + 4.0, 0.0),
         Align2::LEFT_CENTER,
-        format!("{:.0}°", app.robot_heading),
+        format!("👁 {:.0}°", app.robot_heading),
         FontId::proportional(11.0),
         Color32::from_rgb(0, 255, 255),
     );
+}
+
+fn tangent_at_field(pts: &[[f32; 2]], t: f32) -> f32 {
+    let n = pts.len();
+    let idx = ((t * (n-1) as f32) as usize).min(n-2);
+    let dx = pts[idx+1][0] - pts[idx][0];
+    let dy = pts[idx+1][1] - pts[idx][1];
+    dy.atan2(dx).to_degrees().rem_euclid(360.0)
+}
+
+/// Preview del prossimo nodo mentre il cursore si muove sul campo.
+fn draw_preview(painter: &Painter, field: &FieldView, app: &HudApp, hover: Option<egui::Pos2>) {
+    let pos = match hover { Some(p) => p, None => return };
+    let fp  = field.to_field(pos);
+    let fp  = [fp[0].clamp(EXCLUSION_CM, FIELD_CM - EXCLUSION_CM),
+               fp[1].clamp(EXCLUSION_CM, FIELD_CM - EXCLUSION_CM)];
+
+    // Bloccato da barriera → non mostrare preview
+    if point_blocked_by_barrier(fp, app) { return; }
+
+    let ghost_color  = Color32::from_rgba_unmultiplied(255, 255, 255, 60);
+    let ghost_stroke = Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 255, 255, 80));
+    let dot_color    = Color32::from_rgba_unmultiplied(255, 255, 255, 140);
+
+    match app.mode {
+        EditMode::AddLine => {
+            let from = last_point(app);
+            // Linea opaca dal punto precedente al cursore
+            painter.line_segment(
+                [field.to_screen(from), field.to_screen(fp)],
+                ghost_stroke,
+            );
+            // Pallino sul cursore
+            painter.circle_filled(field.to_screen(fp), 5.0, dot_color);
+        }
+        EditMode::AddCurve => {
+            let from = last_point(app);
+            // Control point stimato (stesso calcolo di quando si piazza)
+            let ctrl = [
+                (from[0] + fp[0]) / 2.0,
+                (from[1] + fp[1]) / 2.0 + 30.0,
+            ];
+            // Curva preview campionata come Bezier
+            let p0 = from;
+            let p1 = ctrl;
+            let p2 = ctrl;
+            let p3 = fp;
+            let pts: Vec<egui::Pos2> = (0..=20).map(|i| {
+                let t = i as f32 / 20.0;
+                let u = 1.0 - t;
+                let x = u*u*u*p0[0] + 3.0*u*u*t*p1[0] + 3.0*u*t*t*p2[0] + t*t*t*p3[0];
+                let y = u*u*u*p0[1] + 3.0*u*u*t*p1[1] + 3.0*u*t*t*p2[1] + t*t*t*p3[1];
+                field.to_screen([x, y])
+            }).collect();
+            for w in pts.windows(2) {
+                painter.line_segment([w[0], w[1]], ghost_stroke);
+            }
+            painter.circle_filled(field.to_screen(fp), 5.0, dot_color);
+        }
+        EditMode::AddBarrier => {
+            // Linea dal punto precedente della barriera al cursore
+            if let Some(b) = app.barriers.last() {
+                if !b.closed {
+                    if let Some(last_v) = b.vertices.last() {
+                        painter.line_segment(
+                            [field.to_screen(*last_v), field.to_screen(fp)],
+                            Stroke::new(1.5, Color32::from_rgba_unmultiplied(220, 60, 60, 120)),
+                        );
+                        // Linea tratteggiata di chiusura dal cursore al primo vertice
+                        if b.vertices.len() >= 2 {
+                            draw_dashed_line(
+                                painter,
+                                field.to_screen(fp),
+                                field.to_screen(b.vertices[0]),
+                                5.0, 4.0,
+                                Stroke::new(1.0, Color32::from_rgba_unmultiplied(220, 60, 60, 80)),
+                            );
+                        }
+                    }
+                }
+            }
+            painter.circle_filled(field.to_screen(fp), 5.0,
+                Color32::from_rgba_unmultiplied(220, 60, 60, 180));
+        }
+        EditMode::Select => {}
+    }
 }
 
 fn draw_mouse_coords(painter: &Painter, response: &Response, field: &FieldView) {
@@ -728,7 +884,9 @@ fn brake_point_at(pos: Pos2, field: &FieldView, app: &HudApp) -> Option<usize> {
 }
 
 fn clamp_field(fp: [f32; 2]) -> [f32; 2] {
-    [fp[0].clamp(0.0, FIELD_CM), fp[1].clamp(0.0, FIELD_CM)]
+    // Margine dai bordi del campo uguale alla exclusion zone delle barriere
+    let m = EXCLUSION_CM;
+    [fp[0].clamp(m, FIELD_CM - m), fp[1].clamp(m, FIELD_CM - m)]
 }
 
 fn last_point(app: &HudApp) -> [f32; 2] {

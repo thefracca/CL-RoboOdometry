@@ -7,7 +7,12 @@ pub enum SimState {
     #[default]
     Idle,
     Running,
-    Shooting { remaining: f32 }, // attende N secondi fermo
+    /// Robot fermo in attesa
+    Waiting { remaining: f32 },
+    /// Robot fermo, sta sparando per `remaining` secondi
+    ShootStop { remaining: f32 },
+    /// Robot in movimento, sta sparando (nessuna pausa)
+    ShootMove,
     Finished,
 }
 
@@ -16,7 +21,7 @@ pub struct Simulation {
     pub state:     SimState,
     pub elapsed:   f32,
     pub seg_index: usize,
-    pub t:         f32,     // parametro [0,1] dentro il segmento corrente
+    pub t:         f32,
 }
 
 impl Simulation {
@@ -32,10 +37,13 @@ impl Simulation {
     }
 
     pub fn is_running(&self) -> bool {
-        matches!(self.state, SimState::Running | SimState::Shooting { .. })
+        !matches!(self.state, SimState::Idle | SimState::Finished)
     }
 
-    /// Avanza di dt. Restituisce (pos, heading, intake, flywheel) se in movimento.
+    pub fn is_waiting(&self) -> bool {
+        matches!(self.state, SimState::Waiting { .. })
+    }
+
     pub fn advance(
         &mut self,
         dt: f32,
@@ -45,80 +53,133 @@ impl Simulation {
         if segments.is_empty() { self.state = SimState::Finished; return None; }
 
         self.elapsed += dt;
-        if self.elapsed >= MATCH_DURATION { self.state = SimState::Finished; return None; }
 
-        // ── Fase Shoot (robot fermo) ──────────────────────────
-        if let SimState::Shooting { remaining } = &mut self.state {
+        // ── Bug 2 fix: timer scaduto → Finished ma restituisce ultima pos ──
+        if self.elapsed >= MATCH_DURATION {
+            self.state = SimState::Finished;
+            let pos = current_pos(start, segments, self.seg_index, self.t);
+            return Some((pos.0, pos.1, false, false));
+        }
+
+        // ── Wait: fermo senza sparare ─────────────────────────
+        if let SimState::Waiting { remaining } = &mut self.state {
             *remaining -= dt;
-            if *remaining <= 0.0 {
-                self.next_segment(segments);
+            let done = *remaining <= 0.0;
+            // Leggi pos/opts PRIMA di incrementare seg_index
+            let seg_i = self.seg_index.min(segments.len().saturating_sub(1));
+            let pos   = segments[seg_i].end();
+            let intake   = segments[seg_i].opts().intake;
+            let flywheel = segments[seg_i].opts().flywheel;
+            if done {
+                self.seg_index += 1;
+                self.t = 0.0;
+                self.state = if self.seg_index >= segments.len() {
+                    SimState::Finished
+                } else {
+                    SimState::Running
+                };
             }
-            // Restituisce la posizione corrente (fine del segmento precedente)
-            let pos = if self.seg_index == 0 { start }
-                      else { segments[self.seg_index.saturating_sub(1)].end() };
-            let opts = if self.seg_index > 0 {
-                segments[self.seg_index - 1].opts()
-            } else { segments[0].opts() };
-            return Some((pos, 90.0, opts.intake, opts.flywheel));
+            return Some((pos, 90.0, intake, flywheel));
+        }
+
+        if let SimState::ShootStop { remaining } = &mut self.state {
+            *remaining -= dt;
+            let done = *remaining <= 0.0;
+            // Leggi pos/opts PRIMA di incrementare seg_index
+            let seg_i = self.seg_index.min(segments.len().saturating_sub(1));
+            let pos   = segments[seg_i].end();
+            let intake   = segments[seg_i].opts().intake;
+            let flywheel = segments[seg_i].opts().flywheel;
+            if done {
+                self.seg_index += 1;
+                self.t = 0.0;
+                self.state = if self.seg_index >= segments.len() {
+                    SimState::Finished
+                } else {
+                    SimState::Running
+                };
+            }
+            return Some((pos, 90.0, intake, flywheel));
         }
 
         if self.seg_index >= segments.len() { self.state = SimState::Finished; return None; }
 
-        let seg   = &segments[self.seg_index];
-        let opts  = seg.opts();
-        let from  = prev_point(start, segments, self.seg_index);
-        let pts   = seg.sample(from, 80);
+        let seg    = &segments[self.seg_index];
+        let opts   = seg.opts();
+        let from   = prev_point(start, segments, self.seg_index);
+        let pts    = seg.sample(from, 80);
         let seg_len = arc_length(&pts);
+
+        // Flywheel attivo se ShootMove o se impostato nel segmento
+        let shooting_move = self.state == SimState::ShootMove;
 
         if seg_len < 0.001 {
             self.finish_segment(segments);
             return self.advance(0.0, start, segments);
         }
 
-        // Velocità istantanea in base al profilo
-        let v = opts.speed.velocity_at(self.t, seg_len).max(1.0);
+        let v    = opts.speed.velocity_at(self.t, seg_len).max(1.0);
         let dt_t = (v * dt) / seg_len;
-        self.t += dt_t;
+        self.t  += dt_t;
 
         if self.t >= 1.0 {
             let overshoot = ((self.t - 1.0) * seg_len / v).min(dt);
             self.t = 1.0;
-            let pos = sample_at_t(&pts, 1.0);
-            let heading = tangent_at(&pts, 1.0);
+            let pos     = sample_at_t(&pts, 1.0);
+            let heading = interp_heading(opts.robot_heading_start, opts.robot_heading_end, 1.0);
             self.finish_segment(segments);
-            // Se c'era overshoot e non siamo in Shoot, recupera il tempo
-            if matches!(self.state, SimState::Running) {
+            if matches!(self.state, SimState::Running | SimState::ShootMove) {
                 return self.advance(overshoot, start, segments);
             }
             return Some((pos, heading, opts.intake, opts.flywheel));
         }
 
         let pos     = sample_at_t(&pts, self.t);
-        let heading = tangent_at(&pts, self.t);
-        Some((pos, heading, opts.intake, opts.flywheel))
+        let heading = interp_heading(opts.robot_heading_start, opts.robot_heading_end, self.t);
+        Some((pos, heading, opts.intake, opts.flywheel || shooting_move))
     }
 
     fn finish_segment(&mut self, segments: &[Segment]) {
         let seg = &segments[self.seg_index];
-        // Controlla se c'è un'azione Shoot alla fine
-        if let RobotAction::Shoot(secs) = seg.opts().action {
-            self.state = SimState::Shooting { remaining: secs };
-            self.seg_index += 1;
-            self.t = 0.0;
-        } else {
-            self.next_segment(segments);
+        match seg.opts().action {
+            RobotAction::Wait(secs) => {
+                self.state = SimState::Waiting { remaining: secs };
+                self.t = 0.0;
+            }
+            RobotAction::ShootStop(secs) => {
+                // Bug 3 fix: NON incrementiamo seg_index qui,
+                // lo fa ShootStop quando il timer scade
+                self.state = SimState::ShootStop { remaining: secs };
+                self.t = 0.0;
+                // seg_index rimane invariato finché Shoot non finisce
+            }
+            RobotAction::ShootMove(_) => {
+                // Spara mentre si muove: passa al prossimo segmento normalmente
+                self.state = SimState::ShootMove;
+                self.seg_index += 1;
+                self.t = 0.0;
+                if self.seg_index >= segments.len() {
+                    self.state = SimState::Finished;
+                }
+            }
+            RobotAction::Move => {
+                self.seg_index += 1;
+                self.t = 0.0;
+                if self.seg_index >= segments.len() {
+                    self.state = SimState::Finished;
+                } else {
+                    self.state = SimState::Running;
+                }
+            }
         }
     }
+}
 
-    fn next_segment(&mut self, segments: &[Segment]) {
-        self.seg_index += 1;
-        self.t = 0.0;
-        if self.seg_index >= segments.len() {
-            self.state = SimState::Finished;
-        } else {
-            self.state = SimState::Running;
-        }
-    }
+fn current_pos(start: [f32; 2], segments: &[Segment], seg_i: usize, t: f32) -> ([f32; 2], f32) {
+    let i = seg_i.min(segments.len().saturating_sub(1));
+    let from = if i == 0 { start } else { segments[i-1].end() };
+    let pts = segments[i].sample(from, 80);
+    (sample_at_t(&pts, t), tangent_at(&pts, t))
 }
 
 fn prev_point(start: [f32; 2], segments: &[Segment], i: usize) -> [f32; 2] {
@@ -135,14 +196,21 @@ fn arc_length(pts: &[[f32; 2]]) -> f32 {
 
 fn sample_at_t(pts: &[[f32; 2]], t: f32) -> [f32; 2] {
     let n = pts.len() - 1;
-    let idx = ((t * n as f32) as usize).min(n);
-    pts[idx]
+    pts[((t * n as f32) as usize).min(n)]
 }
 
 fn tangent_at(pts: &[[f32; 2]], t: f32) -> f32 {
     let n = pts.len();
-    let idx = ((t * (n - 1) as f32) as usize).min(n - 2);
-    let dx = pts[idx + 1][0] - pts[idx][0];
-    let dy = pts[idx + 1][1] - pts[idx][1];
+    let idx = ((t * (n-1) as f32) as usize).min(n-2);
+    let dx = pts[idx+1][0] - pts[idx][0];
+    let dy = pts[idx+1][1] - pts[idx][1];
     dy.atan2(dx).to_degrees().rem_euclid(360.0)
+}
+
+/// Interpola l'heading del robot tra start e end lungo t ∈ [0,1].
+/// Prende il percorso più corto attorno al cerchio (max 180°).
+fn interp_heading(start: f32, end: f32, t: f32) -> f32 {
+    let mut delta = (end - start).rem_euclid(360.0);
+    if delta > 180.0 { delta -= 360.0; }
+    (start + delta * t).rem_euclid(360.0)
 }

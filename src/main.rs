@@ -3,6 +3,7 @@
 mod app;
 mod assets;
 mod barrier;
+mod export;
 mod field;
 mod segment;
 mod simulation;
@@ -25,4 +26,3 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Ok(Box::new(HudApp::default()))),
     )
 }
-//gang

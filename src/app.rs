@@ -80,7 +80,8 @@ impl eframe::App for HudApp {
                 self.robot_heading   = heading;
                 self.intake_active   = intake;
                 self.flywheel_active = flywheel;
-            } else if self.sim.state == SimState::Finished {
+            }
+            if self.sim.state == SimState::Finished {
                 self.intake_active   = false;
                 self.flywheel_active = false;
             }

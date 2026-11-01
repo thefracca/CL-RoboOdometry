@@ -1,6 +1,7 @@
 use eframe::egui::{self, Button, Color32, RichText, Vec2};
 use crate::app::{EditMode, HudApp};
 use crate::segment::{HeadingMode, RobotAction, Segment};
+use crate::simulation::SimState as SS;
 use crate::simulation::{SimState, MATCH_DURATION};
 
 const BTN: Vec2 = Vec2::new(120.0, 36.0);
@@ -44,6 +45,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             if ui.add_sized(BTN, Button::new(gl)).clicked() {
                 app.hide_grid = !app.hide_grid;
             }
+            if ui.add_sized(BTN, Button::new("📍 Robot → Start")).clicked() {
+                app.robot_pos     = app.start;
+                app.robot_heading = 90.0;
+            }
             ui.end_row();
         });
 
@@ -79,7 +84,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     ui.label(RichText::new("✅ Percorso completato").color(Color32::GREEN).small());
                 }
             }
-            SimState::Running | SimState::Shooting { .. } => {
+            SimState::Running | SimState::Waiting { .. } | SimState::ShootStop { .. } | SimState::ShootMove => {
                 if ui.add_sized(BTN, Button::new(
                     RichText::new("⏹ Stop").color(Color32::WHITE)
                 ).fill(Color32::from_rgb(180, 50, 50))).clicked() {
@@ -90,9 +95,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("⏱ {:.1}s", remaining))
                     .color(timer_color).size(22.0));
-                if matches!(app.sim.state, SimState::Shooting { .. }) {
-                    ui.label(RichText::new("🎯 SHOOT").color(Color32::YELLOW).size(16.0));
-                }
+                match &app.sim.state {
+                    SimState::Waiting { remaining } =>
+                        ui.label(RichText::new(format!("⏸ WAIT {:.1}s", remaining))
+                            .color(Color32::from_rgb(150, 150, 255)).size(14.0)),
+                    SimState::ShootStop { remaining } =>
+                        ui.label(RichText::new(format!("🎯 SHOOT+STOP {:.1}s", remaining))
+                            .color(Color32::YELLOW).size(14.0)),
+                    SimState::ShootMove =>
+                        ui.label(RichText::new("🎯 SHOOT+MOVE")
+                            .color(Color32::from_rgb(255,180,0)).size(14.0)),
+                    _ => ui.label(""),
+                };
             }
         }
 
@@ -149,24 +163,52 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
 
                 ui.separator();
 
-                // Heading
-                ui.label(RichText::new("Heading").small().strong());
+                // Heading percorso (tangent/fixed)
+                ui.label(RichText::new("Heading percorso").small().strong());
                 heading_selector(ui, &mut opts.heading);
+
+                ui.separator();
+
+                // Heading robot (mecanum — indipendente dal movimento)
+                ui.label(RichText::new("Heading robot (mecanum)").small().strong());
+                ui.label(RichText::new("Il robot guarda in questa direzione\nmentre si muove lungo il segmento").small().weak());
+                ui.add(egui::Slider::new(&mut opts.robot_heading_start, 0.0..=359.0)
+                    .text("inizio °").step_by(1.0));
+                ui.add(egui::Slider::new(&mut opts.robot_heading_end, 0.0..=359.0)
+                    .text("fine °").step_by(1.0));
+                ui.label(RichText::new(format!(
+                    "Rotazione: {:.0}°",
+                    {
+                        let mut d = (opts.robot_heading_end - opts.robot_heading_start).rem_euclid(360.0);
+                        if d > 180.0 { d -= 360.0; }
+                        d
+                    }
+                )).small().weak());
 
                 ui.separator();
 
                 // Azione
                 ui.label(RichText::new("Azione").small().strong());
-                let is_shoot = matches!(opts.action, RobotAction::Shoot(_));
+                let is_wait      = matches!(opts.action, RobotAction::Wait(_));
+                let is_stop      = matches!(opts.action, RobotAction::ShootStop(_));
+                let is_move_shoot= matches!(opts.action, RobotAction::ShootMove(_));
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!is_shoot, "Move").clicked() {
-                        opts.action = RobotAction::Move;
+                    if ui.selectable_label(
+                        matches!(opts.action, RobotAction::Move), "Move"
+                    ).clicked() { opts.action = RobotAction::Move; }
+                    if ui.selectable_label(is_wait, "Wait").clicked() {
+                        opts.action = RobotAction::Wait(1.0);
                     }
-                    if ui.selectable_label(is_shoot, "Shoot").clicked() {
-                        opts.action = RobotAction::Shoot(1.0);
+                    if ui.selectable_label(is_stop, "Shoot+Stop").clicked() {
+                        opts.action = RobotAction::ShootStop(1.0);
+                    }
+                    if ui.selectable_label(is_move_shoot, "Shoot+Move").clicked() {
+                        opts.action = RobotAction::ShootMove(1.0);
                     }
                 });
-                if let RobotAction::Shoot(secs) = &mut opts.action {
+                if let RobotAction::Wait(secs)
+                     | RobotAction::ShootStop(secs)
+                     | RobotAction::ShootMove(secs) = &mut opts.action {
                     ui.add(egui::Slider::new(secs, 0.1..=10.0).text("s").step_by(0.1));
                 }
 
@@ -202,6 +244,28 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             });
         }
         if let Some(i) = barrier_remove { app.barriers.remove(i); }
+
+        ui.separator();
+
+        // ── Export ────────────────────────────────────────────
+        ui.label("Export");
+        if ui.add_sized(
+            Vec2::new(246.0, 36.0),
+            Button::new(
+                RichText::new("💾 Esporta JSON").color(Color32::BLACK)
+            ).fill(Color32::from_rgb(200, 200, 50))
+        ).clicked() {
+            let json = crate::export::to_json(app);
+            // Salva nella directory corrente come "path.json"
+            let path = std::path::Path::new("path.json");
+            match std::fs::write(path, &json) {
+                Ok(_) => { /* ok */ }
+                Err(e) => { eprintln!("Errore export: {e}"); }
+            }
+            // Copia anche negli appunti se possibile (non blocca se fallisce)
+            ui.output_mut(|o| o.copied_text = json);
+        }
+        ui.label(RichText::new("→ salva path.json + copia negli appunti").small().weak());
 
         ui.add_space(8.0);
     });
