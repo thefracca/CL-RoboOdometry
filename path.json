@@ -1,41 +1,44 @@
 {
   "units":"cm",
   "match_duration":30,
-  "start":{"x":182.45,"y":182.71,"heading":90.00},
+  "start":{"x":182.88,"y":182.88,"heading":90.00},
   "segments":[
     {
       "id":0,
       "type":"line",
-      "to":{"x":158.87,"y":305.44},
+      "to":{"x":182.23,"y":271.20},
       "heading":"tangent",
       "robot_heading":{
         "start":90.00,
-        "end":90.00
+        "end":90.00,
+        "rotation_speed":180.00
       },
       "speed":{
         "v_start":0.00,
         "v_max":80.00,
+        "v_min":25.00,
         "accel":120.00,
         "decel":200.00,
         "brake_point":0.7500
       },
-      "action":"move",
+      "action":{"shoot_move":1.00},
       "intake":false,
       "flywheel":false
     },
     {
       "id":1,
-      "type":"curve",
-      "to":{"x":307.26,"y":272.15},
-      "controls":[{"x":233.06,"y":318.79},{"x":240.00,"y":219.46}],
+      "type":"line",
+      "to":{"x":306.20,"y":271.20},
       "heading":"tangent",
       "robot_heading":{
         "start":90.00,
-        "end":90.00
+        "end":90.00,
+        "rotation_speed":180.00
       },
       "speed":{
         "v_start":0.00,
         "v_max":80.00,
+        "v_min":25.00,
         "accel":120.00,
         "decel":200.00,
         "brake_point":0.7500
@@ -46,17 +49,41 @@
     },
     {
       "id":2,
-      "type":"curve",
-      "to":{"x":269.12,"y":106.43},
-      "controls":[{"x":288.19,"y":219.29}],
+      "type":"line",
+      "to":{"x":305.08,"y":162.87},
       "heading":"tangent",
       "robot_heading":{
         "start":90.00,
-        "end":90.00
+        "end":90.00,
+        "rotation_speed":180.00
       },
       "speed":{
         "v_start":0.00,
         "v_max":80.00,
+        "v_min":25.00,
+        "accel":120.00,
+        "decel":200.00,
+        "brake_point":0.7500
+      },
+      "action":"move",
+      "intake":false,
+      "flywheel":false
+    },
+    {
+      "id":3,
+      "type":"curve",
+      "to":{"x":197.49,"y":72.41},
+      "controls":[{"x":277.86,"y":117.69}],
+      "heading":"tangent",
+      "robot_heading":{
+        "start":90.00,
+        "end":90.00,
+        "rotation_speed":180.00
+      },
+      "speed":{
+        "v_start":0.00,
+        "v_max":80.00,
+        "v_min":25.00,
         "accel":120.00,
         "decel":200.00,
         "brake_point":0.7500

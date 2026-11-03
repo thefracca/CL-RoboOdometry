@@ -21,39 +21,26 @@ impl Default for RobotAction {
 }
 
 /// Profilo di velocità per un segmento.
+///
+/// Cinematica (usata identica da simulazione e tempo stimato):
+///  - parte da `v_start` e accelera a `accel` fino a `v_max` (poi mantiene v_max)
+///  - al `brake_point` (frazione della lunghezza del segmento) decelera a `decel`
+///    ma mai sotto `v_min`
+///  - al punto di arrivo il robot si ferma sul posto (anche se v > 0)
 #[derive(Clone, Debug)]
 pub struct SpeedProfile {
     pub v_start:     f32,  // cm/s — velocità iniziale
     pub v_max:       f32,  // cm/s — velocità massima
+    pub v_min:       f32,  // cm/s — velocità minima in frenata
     pub accel:       f32,  // cm/s² — accelerazione
     pub decel:       f32,  // cm/s² — decelerazione
-    /// t ∈ [0,1] — dove inizia la frenata sul segmento
+    /// Frazione [0,1] della lunghezza del segmento dove inizia la frenata
     pub brake_point: f32,
 }
 
 impl Default for SpeedProfile {
     fn default() -> Self {
-        Self { v_start: 0.0, v_max: 80.0, accel: 120.0, decel: 200.0, brake_point: 0.75 }
-    }
-}
-
-impl SpeedProfile {
-    /// Velocità istantanea dato t ∈ [0,1] e la lunghezza del segmento.
-    /// Fase 1: accelera da v_start verso v_max
-    /// Fase 2: viaggia a v_max
-    /// Fase 3: da brake_point decelera verso 0
-    pub fn velocity_at(&self, t: f32, _seg_len: f32) -> f32 {
-        let bp = self.brake_point.clamp(0.01, 0.99);
-
-        if t >= bp {
-            // Fase frenata: decelera linearmente da v_max a 0
-            let frac = (t - bp) / (1.0 - bp);
-            (self.v_max * (1.0 - frac)).max(1.0)
-        } else {
-            // Fase accelerazione: da v_start a v_max
-            let frac = t / bp;
-            (self.v_start + (self.v_max - self.v_start) * frac).max(1.0)
-        }
+        Self { v_start: 0.0, v_max: 80.0, v_min: 25.0, accel: 120.0, decel: 200.0, brake_point: 0.75 }
     }
 }
 
@@ -69,6 +56,9 @@ pub struct SegmentOptions {
     pub robot_heading_start: f32,
     /// Heading del robot alla fine del segmento. Viene interpolato linearmente.
     pub robot_heading_end:   f32,
+    /// Velocità di rotazione (°/s) usata per ruotare dall'heading_end del segmento
+    /// precedente all'heading_start di questo segmento (fase Rotating tra segmenti).
+    pub rotation_speed: f32,
 }
 
 impl Default for SegmentOptions {
@@ -81,34 +71,69 @@ impl Default for SegmentOptions {
             flywheel:            false,
             robot_heading_start: 90.0,
             robot_heading_end:   90.0,
+            rotation_speed:      180.0, // °/s default
         }
+    }
+}
+
+/// Parametri della "ricerca palline": il robot va in linea retta dal punto
+/// precedente a `to` a velocità costante `v`, cercando con la camera dentro
+/// un rettangolo largo `width` il cui asse è la retta partenza→arrivo
+/// (i punti medi dei due lati corti sono partenza e arrivo).
+#[derive(Clone, Debug)]
+pub struct SearchParams {
+    pub v:           f32,  // cm/s — velocità costante
+    pub width:       f32,  // cm — larghezza dell'area di ricerca
+    pub time_limit:  f32,  // s — oltre questo tempo va diretto al punto finale
+    pub shoot_after: bool, // spara fermo appena finita la ricerca
+    pub shoot_secs:  f32,  // s di sparo (se shoot_after)
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        Self { v: 60.0, width: 60.0, time_limit: 5.0, shoot_after: false, shoot_secs: 1.0 }
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum Segment {
-    Line  { to: [f32; 2], opts: SegmentOptions },
-    Curve { controls: Vec<[f32; 2]>, to: [f32; 2], opts: SegmentOptions },
+    Line   { to: [f32; 2], opts: SegmentOptions },
+    Curve  { controls: Vec<[f32; 2]>, to: [f32; 2], opts: SegmentOptions },
+    /// Ricerca palline con camera: linea retta a velocità costante.
+    /// `opts` serve solo per gli heading del robot (start/end/rotation_speed).
+    Search { to: [f32; 2], search: SearchParams, opts: SegmentOptions },
 }
 
 impl Segment {
     pub fn end(&self) -> [f32; 2] {
-        match self { Segment::Line { to, .. } | Segment::Curve { to, .. } => *to }
+        match self {
+            Segment::Line { to, .. } | Segment::Curve { to, .. } | Segment::Search { to, .. } => *to
+        }
+    }
+
+    pub fn set_end(&mut self, p: [f32; 2]) {
+        match self {
+            Segment::Line { to, .. } | Segment::Curve { to, .. } | Segment::Search { to, .. } => *to = p,
+        }
     }
 
     pub fn opts(&self) -> &SegmentOptions {
-        match self { Segment::Line { opts, .. } | Segment::Curve { opts, .. } => opts }
+        match self {
+            Segment::Line { opts, .. } | Segment::Curve { opts, .. } | Segment::Search { opts, .. } => opts
+        }
     }
 
     pub fn opts_mut(&mut self) -> &mut SegmentOptions {
-        match self { Segment::Line { opts, .. } | Segment::Curve { opts, .. } => opts }
+        match self {
+            Segment::Line { opts, .. } | Segment::Curve { opts, .. } | Segment::Search { opts, .. } => opts
+        }
     }
 
     /// Campiona il segmento in n punti uniformi in t — anche le linee
     /// vengono campionate densamente per avere movimento fluido.
     pub fn sample(&self, from: [f32; 2], n: usize) -> Vec<[f32; 2]> {
         match self {
-            Segment::Line { to, .. } => {
+            Segment::Line { to, .. } | Segment::Search { to, .. } => {
                 (0..=n).map(|i| {
                     let t = i as f32 / n as f32;
                     [from[0] + t * (to[0] - from[0]),

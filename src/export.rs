@@ -17,10 +17,11 @@ pub fn to_json(app: &HudApp) -> String {
         let type_str = match seg {
             Segment::Line  { .. } => "line",
             Segment::Curve { .. } => "curve",
+            Segment::Search { .. } => "search",
         };
 
         let to = match seg {
-            Segment::Line  { to, .. } | Segment::Curve { to, .. } =>
+            Segment::Line  { to, .. } | Segment::Curve { to, .. } | Segment::Search { to, .. } =>
                 format!(r#"{{"x":{:.2},"y":{:.2}}}"#, to[0], to[1]),
         };
 
@@ -46,20 +47,33 @@ pub fn to_json(app: &HudApp) -> String {
             RobotAction::ShootMove(secs)  => format!(r#"{{"shoot_move":{:.2}}}"#, secs),
         };
 
+        // Ricerca palline: parametri dedicati (v costante, area, time limit, sparo finale)
+        let search = match seg {
+            Segment::Search { search, .. } => format!(
+                ",\n      \"search\":{{\n        \"v\":{:.2},\n        \"area_width\":{:.2},\n        \"time_limit\":{:.2},\n        \"shoot_after\":{},\n        \"shoot_time\":{:.2}\n      }}",
+                search.v, search.width, search.time_limit, search.shoot_after, search.shoot_secs
+            ),
+            _ => String::new(),
+        };
+        // Durante la ricerca l'intake è sempre attivo
+        let intake = opts.intake || matches!(seg, Segment::Search { .. });
+
         let sp = &opts.speed;
         format!(
             r#"    {{
       "id":{i},
       "type":"{type_str}",
-      "to":{to}{controls},
+      "to":{to}{controls}{search},
       "heading":{heading},
       "robot_heading":{{
         "start":{:.2},
-        "end":{:.2}
+        "end":{:.2},
+        "rotation_speed":{:.2}
       }},
       "speed":{{
         "v_start":{:.2},
         "v_max":{:.2},
+        "v_min":{:.2},
         "accel":{:.2},
         "decel":{:.2},
         "brake_point":{:.4}
@@ -70,8 +84,9 @@ pub fn to_json(app: &HudApp) -> String {
     }}"#,
             opts.robot_heading_start,
             opts.robot_heading_end,
-            sp.v_start, sp.v_max, sp.accel, sp.decel, sp.brake_point,
-            opts.intake, opts.flywheel,
+            opts.rotation_speed,
+            sp.v_start, sp.v_max, sp.v_min, sp.accel, sp.decel, sp.brake_point,
+            intake, opts.flywheel,
         )
     }).collect();
 

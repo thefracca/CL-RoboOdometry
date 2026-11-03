@@ -5,6 +5,7 @@ mod assets;
 mod barrier;
 mod export;
 mod field;
+mod project;
 mod segment;
 mod simulation;
 mod ui;
