@@ -1,9 +1,22 @@
 //! Serializzazione del percorso nel formato JSON definito.
 
 use crate::app::HudApp;
-use crate::barrier::Barrier;
-use crate::segment::{HeadingMode, RobotAction, Segment};
+use crate::segment::{Mechanism, RobotAction, Segment};
 use crate::simulation::MATCH_DURATION;
+
+/// Posizione lungo il percorso (indice segmento + frazione) → {"segment":i,"t":f}
+fn pos_json(p: f32, n_segments: usize) -> String {
+    if n_segments == 0 {
+        return r#"{"segment":0,"t":0.0000}"#.to_string();
+    }
+    let mut seg = p.floor().max(0.0) as usize;
+    let mut t = p - seg as f32;
+    if seg >= n_segments {
+        seg = n_segments - 1;
+        t = 1.0;
+    }
+    format!(r#"{{"segment":{},"t":{:.4}}}"#, seg, t.clamp(0.0, 1.0))
+}
 
 pub fn to_json(app: &HudApp) -> String {
     let start = format!(
@@ -15,19 +28,14 @@ pub fn to_json(app: &HudApp) -> String {
         let opts = seg.opts();
 
         let type_str = match seg {
-            Segment::Line  { .. } => "line",
-            Segment::Curve { .. } => "curve",
+            Segment::Line   { .. } => "line",
+            Segment::Curve  { .. } => "curve",
             Segment::Search { .. } => "search",
         };
 
         let to = match seg {
             Segment::Line  { to, .. } | Segment::Curve { to, .. } | Segment::Search { to, .. } =>
                 format!(r#"{{"x":{:.2},"y":{:.2}}}"#, to[0], to[1]),
-        };
-
-        let heading = match &opts.heading {
-            HeadingMode::Tangent    => r#""tangent""#.to_string(),
-            HeadingMode::Fixed(deg) => format!(r#"{{"fixed":{:.2}}}"#, deg),
         };
 
         let controls = match seg {
@@ -40,14 +48,7 @@ pub fn to_json(app: &HudApp) -> String {
             _ => String::new(),
         };
 
-        let action = match &opts.action {
-            RobotAction::Move             => r#""move""#.to_string(),
-            RobotAction::Wait(secs)       => format!(r#"{{"wait":{:.2}}}"#, secs),
-            RobotAction::ShootStop(secs)  => format!(r#"{{"shoot_stop":{:.2}}}"#, secs),
-            RobotAction::ShootMove(secs)  => format!(r#"{{"shoot_move":{:.2}}}"#, secs),
-        };
-
-        // Ricerca palline: parametri dedicati (v costante, area, time limit, sparo finale)
+        // Ricerca palline: solo i suoi parametri (v costante, area, time limit, sparo finale)
         let search = match seg {
             Segment::Search { search, .. } => format!(
                 ",\n      \"search\":{{\n        \"v\":{:.2},\n        \"area_width\":{:.2},\n        \"time_limit\":{:.2},\n        \"shoot_after\":{},\n        \"shoot_time\":{:.2}\n      }}",
@@ -55,52 +56,61 @@ pub fn to_json(app: &HudApp) -> String {
             ),
             _ => String::new(),
         };
-        // Durante la ricerca l'intake è sempre attivo
-        let intake = opts.intake || matches!(seg, Segment::Search { .. });
 
+        // Velocità: linee = profilo completo, curve = senza frenata, ricerca = nessun blocco
         let sp = &opts.speed;
+        let speed = match seg {
+            Segment::Line { .. } => format!(
+                ",\n      \"speed\":{{\n        \"v_start\":{:.2},\n        \"v_max\":{:.2},\n        \"v_min\":{:.2},\n        \"accel\":{:.2},\n        \"decel\":{:.2},\n        \"brake_point\":{:.4}\n      }}",
+                sp.v_start, sp.v_max, sp.v_min, sp.accel, sp.decel, sp.brake_point
+            ),
+            Segment::Curve { .. } => format!(
+                ",\n      \"speed\":{{\n        \"v_start\":{:.2},\n        \"v_max\":{:.2},\n        \"accel\":{:.2}\n      }}",
+                sp.v_start, sp.v_max, sp.accel
+            ),
+            Segment::Search { .. } => String::new(),
+        };
+
+        let action = match &opts.action {
+            RobotAction::Move             => r#""move""#.to_string(),
+            RobotAction::Wait(secs)       => format!(r#"{{"wait":{:.2}}}"#, secs),
+            RobotAction::ShootStop(secs)  => format!(r#"{{"shoot_stop":{:.2}}}"#, secs),
+            RobotAction::ShootMove(secs)  => format!(r#"{{"shoot_move":{:.2}}}"#, secs),
+        };
+
         format!(
             r#"    {{
       "id":{i},
       "type":"{type_str}",
       "to":{to}{controls}{search},
-      "heading":{heading},
       "robot_heading":{{
         "start":{:.2},
         "end":{:.2},
         "rotation_speed":{:.2}
-      }},
-      "speed":{{
-        "v_start":{:.2},
-        "v_max":{:.2},
-        "v_min":{:.2},
-        "accel":{:.2},
-        "decel":{:.2},
-        "brake_point":{:.4}
-      }},
-      "action":{action},
-      "intake":{},
-      "flywheel":{}
+      }}{speed},
+      "action":{action}
     }}"#,
             opts.robot_heading_start,
             opts.robot_heading_end,
             opts.rotation_speed,
-            sp.v_start, sp.v_max, sp.v_min, sp.accel, sp.decel, sp.brake_point,
-            intake, opts.flywheel,
         )
     }).collect();
 
-    let barriers: Vec<String> = app.barriers.iter().enumerate()
-        .filter(|(_, b)| b.closed)
-        .map(|(i, b)| {
-            let verts: Vec<String> = b.vertices.iter()
-                .map(|v| format!(r#"{{"x":{:.2},"y":{:.2}}}"#, v[0], v[1]))
-                .collect();
-            format!(
-                r#"    {{"id":{i},"vertices":[{}]}}"#,
-                verts.join(",")
-            )
-        }).collect();
+    // Tratti evidenziati: intake / flywheel attivi tra due posizioni del percorso
+    let n = app.segments.len();
+    let mut hl = app.highlights.clone();
+    hl.sort_by(|a, b| a.from.partial_cmp(&b.from).unwrap_or(std::cmp::Ordering::Equal));
+    let mechanisms: Vec<String> = hl.iter().map(|h| {
+        let kind = match h.kind {
+            Mechanism::Intake   => "intake",
+            Mechanism::Flywheel => "flywheel",
+        };
+        format!(
+            r#"    {{"type":"{kind}","from":{},"to":{}}}"#,
+            pos_json(h.from, n),
+            pos_json(h.to, n),
+        )
+    }).collect();
 
     format!(
         r#"{{
@@ -110,12 +120,12 @@ pub fn to_json(app: &HudApp) -> String {
   "segments":[
 {}
   ],
-  "barriers":[
+  "mechanisms":[
 {}
   ]
 }}"#,
         MATCH_DURATION as u32,
         segments.join(",\n"),
-        barriers.join(",\n"),
+        mechanisms.join(",\n"),
     )
 }

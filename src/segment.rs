@@ -1,11 +1,23 @@
-#[derive(Clone, Debug, PartialEq)]
-pub enum HeadingMode {
-    Tangent,
-    Fixed(f32),
+/// Meccanismo che può essere attivato su un tratto evidenziato del percorso.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mechanism {
+    Intake,
+    Flywheel,
 }
 
-impl Default for HeadingMode {
-    fn default() -> Self { HeadingMode::Tangent }
+/// Tratto evidenziato del percorso in cui un meccanismo è attivo.
+/// Le posizioni sono "indice segmento + frazione di lunghezza d'arco":
+/// 2.35 = 35% del segmento #2 (il segmento #0 parte dal punto Start).
+#[derive(Clone, Debug)]
+pub struct Highlight {
+    pub kind: Mechanism,
+    pub from: f32,
+    pub to:   f32,
+}
+
+/// Il meccanismo `kind` è attivo alla posizione `p` lungo il percorso?
+pub fn mechanism_active(highlights: &[Highlight], kind: Mechanism, p: f32) -> bool {
+    highlights.iter().any(|h| h.kind == kind && p >= h.from && p <= h.to)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,11 +58,8 @@ impl Default for SpeedProfile {
 
 #[derive(Clone, Debug)]
 pub struct SegmentOptions {
-    pub heading:       HeadingMode,
     pub speed:         SpeedProfile,
     pub action:        RobotAction,
-    pub intake:        bool,
-    pub flywheel:      bool,
     /// Heading del robot (dove guarda) all'inizio del segmento, in gradi.
     /// Indipendente dalla direzione di movimento (mecanum).
     pub robot_heading_start: f32,
@@ -64,11 +73,8 @@ pub struct SegmentOptions {
 impl Default for SegmentOptions {
     fn default() -> Self {
         Self {
-            heading:             HeadingMode::default(),
             speed:               SpeedProfile::default(),
             action:              RobotAction::default(),
-            intake:              false,
-            flywheel:            false,
             robot_heading_start: 90.0,
             robot_heading_end:   90.0,
             rotation_speed:      180.0, // °/s default
@@ -127,6 +133,14 @@ impl Segment {
         match self {
             Segment::Line { opts, .. } | Segment::Curve { opts, .. } | Segment::Search { opts, .. } => opts
         }
+    }
+
+    /// Profilo di velocità effettivo: sulle curve non c'è punto di frenata
+    /// (il robot arriva a velocità di crociera e si ferma sul posto).
+    pub fn speed_profile(&self) -> SpeedProfile {
+        let mut sp = self.opts().speed.clone();
+        if matches!(self, Segment::Curve { .. }) { sp.brake_point = 1.0; }
+        sp
     }
 
     /// Campiona il segmento in n punti uniformi in t — anche le linee

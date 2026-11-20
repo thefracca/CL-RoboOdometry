@@ -1,7 +1,7 @@
 use eframe::egui;
 use crate::{assets, ui};
 use crate::barrier::Barrier;
-use crate::segment::{Segment, HeadingMode, SegmentOptions};
+use crate::segment::{mechanism_active, Highlight, Mechanism, Segment};
 use crate::simulation::{Simulation, SimState};
 
 #[derive(Clone, Debug)]
@@ -43,6 +43,7 @@ pub enum EditMode {
     AddBarrier,
     AddFocalLine, // primo click = punto A, secondo click = punto B
     AddSearch,    // click = punto di arrivo della ricerca palline
+    AddHighlight, // trascina sul percorso per evidenziare un tratto intake/flywheel
 }
 
 #[derive(Default, Clone, Debug)]
@@ -57,6 +58,8 @@ pub enum Dragging {
     BarrierVertex(usize, usize),
     /// Trascina il brake_point del segmento i lungo il segmento stesso
     BrakePoint(usize),
+    /// Sta trascinando un tratto evidenziato (bozza in `highlight_draft`)
+    Highlighting,
 }
 
 pub struct HudApp {
@@ -75,6 +78,10 @@ pub struct HudApp {
     /// Linee focali: coppie di punti che definiscono una retta infinita
     pub focal_lines: Vec<FocalLine>,
     pub focal_line_first: Option<[f32; 2]>, // primo punto mentre si disegna
+    /// Tratti evidenziati dove intake / flywheel sono attivi
+    pub highlights:      Vec<Highlight>,
+    pub highlight_kind:  Mechanism,
+    pub highlight_draft: Option<(f32, f32)>,
 }
 
 impl Default for HudApp {
@@ -96,7 +103,32 @@ impl Default for HudApp {
             flywheel_active: false,
             focal_lines:      Vec::new(),
             focal_line_first: None,
+            highlights:      Vec::new(),
+            highlight_kind:  Mechanism::Intake,
+            highlight_draft: None,
         }
+    }
+}
+
+impl HudApp {
+    /// Rimuove un segmento e riallinea i tratti evidenziati.
+    pub fn remove_segment(&mut self, i: usize) {
+        if i >= self.segments.len() { return; }
+        self.segments.remove(i);
+        let fi = i as f32;
+        let map = |p: f32| if p >= fi + 1.0 { p - 1.0 } else if p > fi { fi } else { p };
+        for h in &mut self.highlights {
+            h.from = map(h.from);
+            h.to   = map(h.to);
+        }
+        self.highlights.retain(|h| h.to - h.from > 0.01);
+    }
+
+    /// Cancella tutto il percorso (e i tratti evidenziati, che ne dipendono).
+    pub fn clear_path(&mut self) {
+        self.segments.clear();
+        self.highlights.clear();
+        self.highlight_draft = None;
     }
 }
 
@@ -114,8 +146,10 @@ impl eframe::App for HudApp {
             if let Some((pos, heading, intake, flywheel)) = self.sim.advance(dt, start, segs) {
                 self.robot_pos       = pos;
                 self.robot_heading   = heading;
-                self.intake_active   = intake;
-                self.flywheel_active = flywheel;
+                // Intake / flywheel: dai tratti evidenziati (+ sparo/ricerca della simulazione)
+                let gp = self.sim.seg_index as f32 + self.sim.t;
+                self.intake_active   = intake   || mechanism_active(&self.highlights, Mechanism::Intake,   gp);
+                self.flywheel_active = flywheel || mechanism_active(&self.highlights, Mechanism::Flywheel, gp);
             }
             if self.sim.state == SimState::Finished {
                 self.intake_active   = false;

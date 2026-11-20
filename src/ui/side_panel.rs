@@ -1,6 +1,6 @@
 use eframe::egui::{self, Button, Color32, RichText, Vec2};
 use crate::app::{EditMode, HudApp};
-use crate::segment::{HeadingMode, RobotAction, Segment};
+use crate::segment::{Mechanism, RobotAction, Segment};
 use crate::simulation::SimState as SS;
 use crate::simulation::{SimState, MATCH_DURATION};
 
@@ -24,12 +24,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             mode_btn(ui, app, EditMode::AddFocalLine,"📐 Focale");
             mode_btn(ui, app, EditMode::AddSearch,   "🔍 Ricerca");
             ui.end_row();
+            mode_btn(ui, app, EditMode::AddHighlight,"🖍 Evidenzia");
+            ui.end_row();
         });
         ui.label(RichText::new(match app.mode {
             EditMode::Select      => "Trascina punti/robot\nShift+drag robot = ruota",
             EditMode::AddLine     => "Click = nodo linea",
             EditMode::AddCurve    => "Click = nodo curva\nDoppio click = +ctrl pt",
             EditMode::AddBarrier  => "Click = vertice\nDoppio click = chiudi\nTasto dx = annulla",
+            EditMode::AddHighlight=> "Trascina sul percorso per\nevidenziare un tratto\n(tipo scelto sotto)",
             EditMode::AddSearch   => "Click = punto di arrivo\nArea: dall'ultimo punto a qui",
             EditMode::AddFocalLine=> "Click 1 = punto A\nClick 2 = punto B → crea linea",
         }).small().weak());
@@ -51,13 +54,47 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             if let Some(i) = remove_fl { app.focal_lines.remove(i); }
         }
 
+        // ── Evidenziatore intake / flywheel ──────────────────
+        ui.separator();
+        ui.label(RichText::new("Evidenziatore").small().strong());
+        ui.horizontal(|ui| {
+            for (k, label, col) in [
+                (Mechanism::Intake,   "INTAKE",   Color32::from_rgb(0, 200, 100)),
+                (Mechanism::Flywheel, "FLYWHEEL", Color32::from_rgb(255, 160, 0)),
+            ] {
+                let sel = app.highlight_kind == k;
+                let btn = Button::new(RichText::new(label).color(Color32::WHITE).small())
+                    .fill(if sel { col } else { Color32::from_gray(60) });
+                if ui.add_sized(Vec2::new(80.0, 26.0), btn).clicked() {
+                    app.highlight_kind = k;
+                    app.mode = EditMode::AddHighlight;
+                }
+            }
+        });
+        if app.highlights.is_empty() {
+            ui.label(RichText::new("(nessun tratto evidenziato)").small().weak());
+        }
+        let mut remove_hl: Option<usize> = None;
+        for (i, h) in app.highlights.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let (name, col) = match h.kind {
+                    Mechanism::Intake   => ("INTAKE",   Color32::from_rgb(0, 200, 100)),
+                    Mechanism::Flywheel => ("FLYWHEEL", Color32::from_rgb(255, 160, 0)),
+                };
+                ui.label(RichText::new(format!("{name} {} → {}", fmt_pos(h.from), fmt_pos(h.to)))
+                    .small().color(col));
+                if ui.small_button("✖").clicked() { remove_hl = Some(i); }
+            });
+        }
+        if let Some(i) = remove_hl { app.highlights.remove(i); }
+
         ui.separator();
 
         // ── Azioni ──────────────────────────────────────────
         ui.label("Azioni");
         egui::Grid::new("action_grid").num_columns(2).spacing([6.0, 6.0]).show(ui, |ui| {
             if ui.add_sized(BTN, Button::new("🗑 Percorso")).clicked() {
-                app.segments.clear();
+                app.clear_path();
             }
             if ui.add_sized(BTN, Button::new("🗑 Barriere")).clicked() {
                 app.barriers.clear();
@@ -194,6 +231,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     return;
                 }
 
+                let is_line  = matches!(app.segments[i], Segment::Line { .. });
                 let opts = app.segments[i].opts_mut();
 
                 // Velocità
@@ -204,19 +242,17 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     .text("v_max cm/s").step_by(1.0));
                 ui.add(egui::Slider::new(&mut opts.speed.accel, 1.0..=500.0)
                     .text("accel cm/s²").step_by(1.0));
-                ui.add(egui::Slider::new(&mut opts.speed.decel, 1.0..=500.0)
-                    .text("decel cm/s²").step_by(1.0));
-                ui.add(egui::Slider::new(&mut opts.speed.v_min, 1.0..=150.0)
-                    .text("v_min frenata cm/s").step_by(1.0));
-                ui.add(egui::Slider::new(&mut opts.speed.brake_point, 0.1..=0.99)
-                    .text("frena a (% lungh.)").step_by(0.01));
-                ui.label(RichText::new("(trascina il punto ▼ sul campo)").small().weak());
-
-                ui.separator();
-
-                // Heading percorso (tangent/fixed)
-                ui.label(RichText::new("Heading percorso").small().strong());
-                heading_selector(ui, &mut opts.heading);
+                if is_line {
+                    ui.add(egui::Slider::new(&mut opts.speed.decel, 1.0..=500.0)
+                        .text("decel cm/s²").step_by(1.0));
+                    ui.add(egui::Slider::new(&mut opts.speed.v_min, 1.0..=150.0)
+                        .text("v_min frenata cm/s").step_by(1.0));
+                    ui.add(egui::Slider::new(&mut opts.speed.brake_point, 0.1..=0.99)
+                        .text("frena a (% lungh.)").step_by(0.01));
+                    ui.label(RichText::new("(trascina il punto ▼ sul campo)").small().weak());
+                } else {
+                    ui.label(RichText::new("Curva: nessun punto di frenata,\nsi ferma sul posto a fine segmento").small().weak());
+                }
 
                 ui.separator();
 
@@ -266,21 +302,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     ui.add(egui::Slider::new(secs, 0.1..=10.0).text("s").step_by(0.1));
                 }
 
-                ui.separator();
-
-                // Meccanismi
-                ui.label(RichText::new("Meccanismi").small().strong());
-                ui.horizontal(|ui| {
-                    toggle_btn(ui, &mut opts.intake,   "INTAKE",   Color32::from_rgb(0, 200, 100));
-                    toggle_btn(ui, &mut opts.flywheel, "FLYWHEEL", Color32::from_rgb(255, 160, 0));
-                });
 
                 if ui.small_button("✖ elimina segmento").clicked() {
                     to_remove = Some(i);
                 }
             });
         }
-        if let Some(i) = to_remove { app.segments.remove(i); }
+        if let Some(i) = to_remove { app.remove_segment(i); }
 
         ui.separator();
 
@@ -311,6 +339,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 .color(color).small());
         }
 
+        if !app.segments.is_empty() {
+            ui.separator();
+            speed_graph(ui, app);
+        }
         ui.separator();
 
         // ── Progetto ──────────────────────────────────────────
@@ -373,32 +405,10 @@ fn mode_btn(ui: &mut egui::Ui, app: &mut HudApp, mode: EditMode, label: &str) {
     }
 }
 
-fn toggle_btn(ui: &mut egui::Ui, val: &mut bool, label: &str, on_color: Color32) {
-    let fill = if *val { on_color } else { Color32::from_gray(60) };
-    let text = RichText::new(label).color(Color32::WHITE).small();
-    if ui.add_sized(Vec2::new(80.0, 28.0), Button::new(text).fill(fill)).clicked() {
-        *val = !*val;
-    }
-}
-
 fn indicator(ui: &mut egui::Ui, label: &str, active: bool, color: Color32) {
     let fill = if active { color } else { Color32::from_gray(40) };
     let text = RichText::new(label).color(Color32::WHITE).small();
     ui.add_sized(Vec2::new(80.0, 24.0), Button::new(text).fill(fill).sense(egui::Sense::hover()));
-}
-
-fn heading_selector(ui: &mut egui::Ui, heading: &mut HeadingMode) {
-    let is_tangent = *heading == HeadingMode::Tangent;
-    let mut tangent = is_tangent;
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut tangent, "Tangent");
-        if tangent != is_tangent {
-            *heading = if tangent { HeadingMode::Tangent } else { HeadingMode::Fixed(0.0) };
-        }
-        if let HeadingMode::Fixed(a) = heading {
-            ui.add(egui::DragValue::new(a).speed(1.0).suffix("°"));
-        }
-    });
 }
 
 /// Pannello di un segmento "Ricerca palline".
@@ -427,4 +437,62 @@ fn search_ui(
     ui.add(egui::Slider::new(&mut opts.rotation_speed, 10.0..=720.0).text("vel. rot. °/s").step_by(5.0));
 
     ui.separator();
+}
+
+/// Posizione lungo il percorso → "#segmento·percentuale"
+fn fmt_pos(p: f32) -> String {
+    format!("#{}·{:.0}%", p.floor().max(0.0) as usize, (p - p.floor()) * 100.0)
+}
+
+/// Piccolo grafico velocità/tempo dell'intero percorso (stima), con cursore durante la simulazione.
+fn speed_graph(ui: &mut egui::Ui, app: &HudApp) {
+    let trace = crate::simulation::speed_trace(app.start, &app.segments);
+    let total = trace.last().map(|p| p[0]).unwrap_or(0.0);
+    let t_max = total.max(MATCH_DURATION);
+    let v_top = trace.iter().map(|p| p[1]).fold(10.0_f32, f32::max) * 1.1;
+
+    ui.label(RichText::new("Velocità nel tempo").small().strong());
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 90.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_gray(25));
+
+    let to_p = |t: f32, v: f32| egui::Pos2::new(
+        rect.left() + t / t_max * rect.width(),
+        rect.bottom() - v / v_top * rect.height(),
+    );
+
+    // Limite dei 30 s
+    let x30 = to_p(MATCH_DURATION, 0.0).x;
+    painter.line_segment(
+        [egui::Pos2::new(x30, rect.top()), egui::Pos2::new(x30, rect.bottom())],
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 80, 80, 120)),
+    );
+
+    let pts: Vec<egui::Pos2> = trace.iter().map(|p| to_p(p[0], p[1])).collect();
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, Color32::from_rgb(100, 180, 255))));
+
+    // Cursore del tempo di simulazione
+    if app.sim.is_running() || app.sim.state == SimState::Finished {
+        let x = to_p(app.sim.elapsed.min(t_max), 0.0).x;
+        painter.line_segment(
+            [egui::Pos2::new(x, rect.top()), egui::Pos2::new(x, rect.bottom())],
+            egui::Stroke::new(1.5, Color32::YELLOW),
+        );
+    }
+
+    painter.text(
+        rect.left_top() + Vec2::new(3.0, 2.0),
+        egui::Align2::LEFT_TOP,
+        format!("{:.0} cm/s", v_top / 1.1),
+        egui::FontId::proportional(9.0),
+        Color32::GRAY,
+    );
+    painter.text(
+        rect.right_bottom() + Vec2::new(-3.0, -2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("{:.0} s", t_max),
+        egui::FontId::proportional(9.0),
+        Color32::GRAY,
+    );
 }

@@ -31,10 +31,6 @@ fn serialize(app: &HudApp) -> String {
         let ctrls = controls.iter()
             .map(|c| format!("[{:.4},{:.4}]", c[0], c[1]))
             .collect::<Vec<_>>().join(",");
-        let heading = match &opts.heading {
-            HeadingMode::Tangent    => "\"tangent\"".to_string(),
-            HeadingMode::Fixed(deg) => format!("{:.4}", deg),
-        };
         let action = match &opts.action {
             RobotAction::Move             => "\"move\"".to_string(),
             RobotAction::Wait(s)          => format!("\"wait:{:.4}\"", s),
@@ -50,13 +46,12 @@ fn serialize(app: &HudApp) -> String {
             _ => String::new(),
         };
         format!(
-            r#"{{"t":"{type_str}","to":[{:.4},{:.4}],"ctrl":[{ctrls}],"hdg":{heading},"act":{action},"spd":[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}],"rhs":{:.4},"rhe":{:.4},"rs":{:.4},"in":{},"fw":{}{sr}}}"#,
+            r#"{{"t":"{type_str}","to":[{:.4},{:.4}],"ctrl":[{ctrls}],"act":{action},"spd":[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}],"rhs":{:.4},"rhe":{:.4},"rs":{:.4}{sr}}}"#,
             to[0], to[1],
             opts.speed.v_start, opts.speed.v_max, opts.speed.accel,
             opts.speed.decel, opts.speed.brake_point, opts.speed.v_min,
             opts.robot_heading_start, opts.robot_heading_end,
             opts.rotation_speed,
-            opts.intake, opts.flywheel,
         )
     }).collect();
 
@@ -72,12 +67,18 @@ fn serialize(app: &HudApp) -> String {
             f.a[0], f.a[1], f.b[0], f.b[1], f.snap_radius_cm, f.visible)
     }).collect();
 
+    let hl: Vec<String> = app.highlights.iter().map(|h| {
+        let k = if h.kind == Mechanism::Intake { 0 } else { 1 };
+        format!("[{},{:.4},{:.4}]", k, h.from, h.to)
+    }).collect();
+
     format!(
-        r#"{{"ver":2,"start":[{:.4},{:.4}],"rh":{:.4},"segs":[{}],"barriers":[{}],"focal":[{}]}}"#,
+        r#"{{"ver":2,"start":[{:.4},{:.4}],"rh":{:.4},"segs":[{}],"barriers":[{}],"focal":[{}],"hl":[{}]}}"#,
         app.start[0], app.start[1], app.robot_heading,
         segs.join(","),
         barriers.join(","),
         focal.join(","),
+        hl.join(","),
     )
 }
 
@@ -107,12 +108,6 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
                            c[1].as_f64().unwrap_or(0.0) as f32])
                 .collect();
 
-            let heading = if s["hdg"] == "tangent" {
-                HeadingMode::Tangent
-            } else {
-                HeadingMode::Fixed(s["hdg"].as_f64().unwrap_or(0.0) as f32)
-            };
-
             let act_str = s["act"].as_str().unwrap_or("move");
             let action = if act_str == "move" {
                 RobotAction::Move
@@ -137,11 +132,8 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
             };
 
             let opts = SegmentOptions {
-                heading,
                 speed,
                 action,
-                intake:              s["in"].as_bool().unwrap_or(false),
-                flywheel:            s["fw"].as_bool().unwrap_or(false),
                 robot_heading_start: s["rhs"].as_f64().unwrap_or(90.0) as f32,
                 robot_heading_end:   s["rhe"].as_f64().unwrap_or(90.0) as f32,
                 rotation_speed:      s["rs"].as_f64().unwrap_or(180.0) as f32,
@@ -191,6 +183,19 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
             line.snap_radius_cm = g(4).max(1.0);
             line.visible = f[5].as_bool().unwrap_or(true);
             app.focal_lines.push(line);
+        }
+    }
+
+    app.highlights.clear();
+    app.highlight_draft = None;
+    if let Some(hl) = v["hl"].as_array() {
+        for h in hl {
+            let kind = if h[0].as_i64().unwrap_or(0) == 1 { Mechanism::Flywheel } else { Mechanism::Intake };
+            let from = h[1].as_f64().unwrap_or(0.0) as f32;
+            let to   = h[2].as_f64().unwrap_or(0.0) as f32;
+            if to > from {
+                app.highlights.push(Highlight { kind, from, to });
+            }
         }
     }
 

@@ -16,6 +16,9 @@ const CTRL_RADIUS: f32 = 10.0;
 const VERTEX_RADIUS: f32 = 10.0;
 const HIT_EXTRA: f32 = 8.0;
 const ROBOT_SIZE_CM: f32 = 45.0;
+/// Campo visivo della camera (davanti al robot)
+const CAM_FOV_DEG: f32 = 150.0;
+const CAM_RANGE_CM: f32 = 100.0;
 
 pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
     // ── Shortcut da tastiera ──────────────────────────────────
@@ -27,6 +30,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         if i.key_pressed(egui::Key::Num4) { app.mode = EditMode::AddBarrier; }
         if i.key_pressed(egui::Key::Num5) { app.mode = EditMode::AddFocalLine; }
         if i.key_pressed(egui::Key::Num6) { app.mode = EditMode::AddSearch; }
+        if i.key_pressed(egui::Key::Num7) { app.mode = EditMode::AddHighlight; }
         // Griglia
         if i.key_pressed(egui::Key::G) { app.hide_grid = !app.hide_grid; }
         // Robot → Start
@@ -48,7 +52,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         }
         // Cancella percorso
         if i.key_pressed(egui::Key::Delete) && i.modifiers.shift {
-            app.segments.clear();
+            app.clear_path();
         }
         // Salva / Carica
         if i.key_pressed(egui::Key::S) && i.modifiers.ctrl {
@@ -64,7 +68,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         }
         // Undo ultimo segmento
         if i.key_pressed(egui::Key::Z) && i.modifiers.ctrl {
-            app.segments.pop();
+            let n = app.segments.len();
+            if n > 0 { app.remove_segment(n - 1); }
         }
         // Undo ultimo vertice barriera
         if i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && i.modifiers.shift {
@@ -86,6 +91,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         draw_field(&painter, &field, app);
         handle_input(&response, &field, app, ui.ctx());
         draw_path(&painter, &field, app);
+        draw_highlights(&painter, &field, app);
         draw_brake_points(&painter, &field, app);
         draw_barriers(&painter, &field, app);
         draw_barrier_exclusion_zones(&painter, &field, app);
@@ -102,6 +108,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("4", "Barriera"),
     ("5", "Focale"),
     ("6", "Ricerca palline"),
+    ("7", "Evidenzia intake/flywheel"),
     ("G", "Griglia + snap ON/OFF"),
     ("Space", "Play / Stop sim"),
     ("Home", "Robot → Start"),
@@ -144,7 +151,17 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
         if let Some(pos) = response.interact_pointer_pos() {
             let fp = field.to_field(pos);
 
-            if is_near_robot(pos, field, app) {
+            if app.mode == EditMode::AddHighlight {
+                // Evidenziatore: il drag parte dal punto del percorso più vicino al click
+                let origin = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+                match path_pos_nearest(app, field, origin) {
+                    Some((p, d)) if d <= 30.0 => {
+                        app.dragging = Dragging::Highlighting;
+                        app.highlight_draft = Some((p, p));
+                    }
+                    _ => app.dragging = Dragging::Nothing,
+                }
+            } else if is_near_robot(pos, field, app) {
                 app.dragging = if shift {
                     Dragging::RotateRobot { start_x: pos.x, start_heading: app.robot_heading }
                 } else {
@@ -217,6 +234,13 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                         }
                     }
                 }
+                Dragging::Highlighting => {
+                    if let Some((p, _)) = path_pos_nearest(app, field, pos) {
+                        if let Some((a, _)) = app.highlight_draft {
+                            app.highlight_draft = Some((a, p));
+                        }
+                    }
+                }
                 Dragging::Nothing => {}
             }
         }
@@ -244,6 +268,15 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                         use crate::barrier::push_out_of_barriers;
                         let fixed = push_out_of_barriers(end, &app.barriers, EXCLUSION_CM);
                         app.segments[i-1].set_end(fixed);
+                    }
+                }
+            }
+            Dragging::Highlighting => {
+                if let Some((a, b)) = app.highlight_draft.take() {
+                    let (f, t) = if a <= b { (a, b) } else { (b, a) };
+                    if t - f > 0.01 {
+                        let kind = app.highlight_kind;
+                        app.highlights.push(crate::segment::Highlight { kind, from: f, to: t });
                     }
                 }
             }
@@ -344,7 +377,7 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                             app.focal_line_first = Some(clamped);
                         }
                     }
-                    EditMode::Select => {}
+                    EditMode::Select | EditMode::AddHighlight => {}
                 }
             }
         }
@@ -696,6 +729,74 @@ fn draw_path(painter: &Painter, field: &FieldView, app: &HudApp) {
     }
 }
 
+/// Punto del percorso più vicino a `pos` (schermo): (posizione = indice segmento + frazione, distanza px).
+fn path_pos_nearest(app: &HudApp, field: &FieldView, pos: Pos2) -> Option<(f32, f32)> {
+    let mut best: Option<(f32, f32)> = None;
+    let mut prev = app.start;
+    for (i, seg) in app.segments.iter().enumerate() {
+        let pts = seg.sample(prev, 120);
+        let fr = crate::simulation::fractions(&pts);
+        for (k, p) in pts.iter().enumerate() {
+            let d = field.to_screen(*p).distance(pos);
+            if best.map_or(true, |b| d < b.1) {
+                best = Some((i as f32 + fr[k], d));
+            }
+        }
+        prev = seg.end();
+    }
+    best
+}
+
+/// Punti (cm) del percorso tra le posizioni `from` e `to`.
+fn highlight_points(app: &HudApp, from: f32, to: f32) -> Vec<[f32; 2]> {
+    let n = app.segments.len();
+    let mut out = Vec::new();
+    if n == 0 || to <= from { return out; }
+    let first = from.floor().max(0.0) as usize;
+    let last = (to.ceil().max(0.0) as usize).min(n);
+    for i in first..last {
+        let prev = if i == 0 { app.start } else { app.segments[i - 1].end() };
+        let pts = app.segments[i].sample(prev, 60);
+        let fr = crate::simulation::fractions(&pts);
+        let lo = (from - i as f32).max(0.0);
+        let hi = (to - i as f32).min(1.0);
+        if hi <= lo { continue; }
+        out.push(crate::simulation::point_at_fraction(&pts, lo));
+        for (k, p) in pts.iter().enumerate() {
+            if fr[k] > lo && fr[k] < hi { out.push(*p); }
+        }
+        out.push(crate::simulation::point_at_fraction(&pts, hi));
+    }
+    out
+}
+
+/// Tratti evidenziati (intake verde largo, flywheel arancione stretto sopra) + bozza in corso.
+fn draw_highlights(painter: &Painter, field: &FieldView, app: &HudApp) {
+    use crate::segment::Mechanism;
+    let style = |k: Mechanism, alpha: u8| -> Stroke {
+        match k {
+            Mechanism::Intake   => Stroke::new(10.0, Color32::from_rgba_unmultiplied(0, 200, 100, alpha)),
+            Mechanism::Flywheel => Stroke::new(5.0,  Color32::from_rgba_unmultiplied(255, 160, 0, alpha)),
+        }
+    };
+    let draw = |from: f32, to: f32, stroke: Stroke| {
+        let pts: Vec<Pos2> = highlight_points(app, from, to)
+            .iter().map(|p| field.to_screen(*p)).collect();
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+    };
+    for kind in [Mechanism::Intake, Mechanism::Flywheel] {
+        for h in app.highlights.iter().filter(|h| h.kind == kind) {
+            draw(h.from, h.to, style(kind, 150));
+        }
+    }
+    if let Some((a, b)) = app.highlight_draft {
+        let (f, t) = if a <= b { (a, b) } else { (b, a) };
+        draw(f, t, style(app.highlight_kind, 100));
+    }
+}
+
 fn draw_waypoint(painter: &Painter, field: &FieldView, p: [f32; 2], index: usize) {
     let pos = field.to_screen(p);
     let color = if index == 0 { Color32::GREEN } else { Color32::from_rgb(255, 140, 0) };
@@ -732,6 +833,23 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
 
     // Durante la ricerca palline il robot cambia colore (viola)
     let searching = app.sim.state == crate::simulation::SimState::Searching;
+
+    // Campo visivo della camera (150°) davanti al robot
+    {
+        let r_px = CAM_RANGE_CM * scale;
+        let mut fov: Vec<Pos2> = vec![center];
+        let steps = 30;
+        for k in 0..=steps {
+            let a = (app.robot_heading - CAM_FOV_DEG / 2.0 + CAM_FOV_DEG * k as f32 / steps as f32) * PI / 180.0;
+            fov.push(center + Vec2::new(a.cos(), -a.sin()) * r_px);
+        }
+        let alpha = if searching { 60 } else { 28 };
+        painter.add(egui::Shape::convex_polygon(
+            fov,
+            Color32::from_rgba_unmultiplied(255, 240, 120, alpha),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 240, 120, 120)),
+        ));
+    }
     let (body_fill, body_stroke) = if searching {
         (Color32::from_rgba_unmultiplied(180, 80, 255, 150), Color32::from_rgb(215, 140, 255))
     } else {
@@ -956,7 +1074,7 @@ fn draw_preview(painter: &Painter, field: &FieldView, app: &HudApp, hover: Optio
             );
             painter.circle_filled(field.to_screen(fp), 5.0, Color32::from_rgb(190, 120, 255));
         }
-        EditMode::Select => {}
+        EditMode::Select | EditMode::AddHighlight => {}
     }
 }
 
@@ -1128,8 +1246,8 @@ fn is_near_robot(pos: Pos2, field: &FieldView, app: &HudApp) -> bool {
 fn draw_brake_points(painter: &Painter, field: &FieldView, app: &HudApp) {
     let mut prev = app.start;
     for (i, seg) in app.segments.iter().enumerate() {
-        // La ricerca ha velocità costante: niente punto di frenata
-        if matches!(seg, Segment::Search { .. }) { prev = seg.end(); continue; }
+        // Il punto di frenata esiste solo sulle linee (curve e ricerca non frenano)
+        if !matches!(seg, Segment::Line { .. }) { prev = seg.end(); continue; }
         let pts = seg.sample(prev, 120);
         let t   = seg.opts().speed.brake_point;
         let bp  = sample_at_t_field(&pts, t);
@@ -1182,8 +1300,8 @@ fn closest_t_on_path(pts: &[[f32; 2]], field: &FieldView, pos: Pos2) -> f32 {
 fn brake_point_at(pos: Pos2, field: &FieldView, app: &HudApp) -> Option<usize> {
     let mut prev = app.start;
     for (i, seg) in app.segments.iter().enumerate() {
-        // La ricerca ha velocità costante: niente punto di frenata
-        if matches!(seg, Segment::Search { .. }) { prev = seg.end(); continue; }
+        // Il punto di frenata esiste solo sulle linee (curve e ricerca non frenano)
+        if !matches!(seg, Segment::Line { .. }) { prev = seg.end(); continue; }
         let pts = seg.sample(prev, 120);
         let t   = seg.opts().speed.brake_point;
         let bp  = sample_at_t_field(&pts, t);
@@ -1326,6 +1444,6 @@ fn last_point(app: &HudApp) -> [f32; 2] {
 
 fn remove_node(app: &mut HudApp, i: usize) {
     if i > 0 && i <= app.segments.len() {
-        app.segments.remove(i - 1);
+        app.remove_segment(i - 1);
     }
 }

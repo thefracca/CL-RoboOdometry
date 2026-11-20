@@ -67,8 +67,10 @@ fn interp_heading(start: f32, end: f32, t: f32) -> f32 {
     (start + heading_delta(start, end) * t).rem_euclid(360.0)
 }
 
-/// Tempo totale stimato: stessa cinematica della simulazione, passo fine.
-pub fn estimate_total_time(start: [f32; 2], segments: &[Segment]) -> f32 {
+/// Profilo di velocità nel tempo dell'intero percorso: punti [tempo s, velocità cm/s].
+/// Stessa cinematica della simulazione (passo fine).
+pub fn speed_trace(start: [f32; 2], segments: &[Segment]) -> Vec<[f32; 2]> {
+    let mut out: Vec<[f32; 2]> = vec![[0.0, 0.0]];
     let mut total = 0.0_f32;
     let mut prev = start;
     let mut prev_heading_end: Option<f32> = None;
@@ -79,36 +81,66 @@ pub fn estimate_total_time(start: [f32; 2], segments: &[Segment]) -> f32 {
         // Rotazione sul posto tra la fine del segmento precedente e l'inizio di questo
         if let Some(pe) = prev_heading_end {
             let d = heading_delta(pe, opts.robot_heading_start).abs();
-            if d > 1.0 { total += d / opts.rotation_speed.max(1.0); }
+            if d > 1.0 {
+                out.push([total, 0.0]);
+                total += d / opts.rotation_speed.max(1.0);
+                out.push([total, 0.0]);
+            }
         }
 
         let pts = seg.sample(prev, SAMPLES);
         let len = *cumulative(&pts).last().unwrap_or(&0.0);
-        if let Segment::Search { search, .. } = seg {
-            // Ricerca: velocità costante, si ferma sul posto all'arrivo
-            total += len / search.v.max(1.0);
-        } else if len > 0.001 {
-            let dt = 0.005;
-            let (mut v, mut s, mut t) = (opts.speed.v_start, 0.0_f32, 0.0_f32);
-            let mut guard = 0;
-            while s < len && guard < 400_000 {
-                let r = kin_step(v, s, len, &opts.speed, dt);
-                v = r.0; s = r.1; t += dt; guard += 1;
+        if len > 0.001 {
+            if let Segment::Search { search, .. } = seg {
+                // Ricerca: velocità costante, si ferma sul posto all'arrivo
+                let v = search.v.max(1.0);
+                out.push([total, v]);
+                total += len / v;
+                out.push([total, v]);
+            } else {
+                let sp = seg.speed_profile();
+                let dt = 0.005;
+                let (mut v, mut s, mut t) = (sp.v_start, 0.0_f32, 0.0_f32);
+                let mut next_rec = 0.0_f32;
+                let mut guard = 0;
+                while s < len && guard < 400_000 {
+                    if t >= next_rec {
+                        out.push([total + t, v]);
+                        next_rec = t + 0.05;
+                    }
+                    let r = kin_step(v, s, len, &sp, dt);
+                    v = r.0; s = r.1; t += dt; guard += 1;
+                }
+                total += t;
+                out.push([total, v]);
             }
-            total += t;
+            out.push([total, 0.0]);
         }
 
         match opts.action {
-            RobotAction::Wait(x) | RobotAction::ShootStop(x) => total += x,
+            RobotAction::Wait(x) | RobotAction::ShootStop(x) => {
+                out.push([total, 0.0]);
+                total += x;
+                out.push([total, 0.0]);
+            }
             _ => {}
         }
         if let Segment::Search { search, .. } = seg {
-            if search.shoot_after { total += search.shoot_secs; }
+            if search.shoot_after {
+                out.push([total, 0.0]);
+                total += search.shoot_secs;
+                out.push([total, 0.0]);
+            }
         }
         prev = seg.end();
         prev_heading_end = Some(opts.robot_heading_end);
     }
-    total
+    out
+}
+
+/// Tempo totale stimato (ultimo istante di `speed_trace`).
+pub fn estimate_total_time(start: [f32; 2], segments: &[Segment]) -> f32 {
+    speed_trace(start, segments).last().map(|p| p[0]).unwrap_or(0.0)
 }
 
 // ════════════════════════════════════════════════════════════
@@ -167,7 +199,7 @@ impl Simulation {
     fn hold_pose(&self, segments: &[Segment], shooting: bool) -> ([f32; 2], f32, bool, bool) {
         let i = self.seg_index.min(segments.len() - 1);
         let o = segments[i].opts();
-        (segments[i].end(), o.robot_heading_end, o.intake, o.flywheel || shooting)
+        (segments[i].end(), o.robot_heading_end, false, shooting)
     }
 
     pub fn advance(
@@ -247,9 +279,10 @@ impl Simulation {
             return self.advance(0.0, start, segments);
         }
 
+        let sp = seg.speed_profile();
         let (nv, ns) = match search_v {
             Some(v) => (v, self.s + v * dt),
-            None    => kin_step(self.v, self.s, seg_len, &opts.speed, dt),
+            None    => kin_step(self.v, self.s, seg_len, &sp, dt),
         };
         self.seg_time += dt;
         self.v = nv;
@@ -261,8 +294,8 @@ impl Simulation {
             self.t = 1.0;
             let pos = *pts.last().unwrap();
             let heading = opts.robot_heading_end;
-            let intake = opts.intake || is_search;
-            let flywheel = opts.flywheel || shooting_move;
+            let intake = is_search;
+            let flywheel = shooting_move;
             self.finish_segment(segments);
             if self.state == SimState::Running {
                 // Recupera il tempo avanzato nel segmento successivo
@@ -275,7 +308,7 @@ impl Simulation {
         self.t = (self.s / seg_len).clamp(0.0, 1.0);
         let pos = point_at_distance(&pts, &cum, self.s);
         let heading = interp_heading(opts.robot_heading_start, opts.robot_heading_end, self.t);
-        Some((pos, heading, opts.intake || is_search, opts.flywheel || shooting_move))
+        Some((pos, heading, is_search, shooting_move))
     }
 
     /// Il robot è arrivato in fondo al segmento: si ferma sul posto.
