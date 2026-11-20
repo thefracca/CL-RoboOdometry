@@ -78,6 +78,11 @@ pub fn to_json(app: &HudApp) -> String {
             RobotAction::ShootMove(secs)  => format!(r#"{{"shoot_move":{:.2}}}"#, secs),
         };
 
+        let align = match opts.align {
+            Some(d) => format!("{:.2}", d),
+            None    => "null".to_string(),
+        };
+
         format!(
             r#"    {{
       "id":{i},
@@ -88,7 +93,8 @@ pub fn to_json(app: &HudApp) -> String {
         "end":{:.2},
         "rotation_speed":{:.2}
       }}{speed},
-      "action":{action}
+      "action":{action},
+      "align":{align}
     }}"#,
             opts.robot_heading_start,
             opts.robot_heading_end,
@@ -104,6 +110,7 @@ pub fn to_json(app: &HudApp) -> String {
         let kind = match h.kind {
             Mechanism::Intake   => "intake",
             Mechanism::Flywheel => "flywheel",
+            Mechanism::IntakeDown => "intake_down",
         };
         format!(
             r#"    {{"type":"{kind}","from":{},"to":{}}}"#,
@@ -111,6 +118,16 @@ pub fn to_json(app: &HudApp) -> String {
             pos_json(h.to, n),
         )
     }).collect();
+
+    // Parcheggio d'emergenza (null se disattivato)
+    let park = if app.park.enabled {
+        format!(
+            r#"{{"x":{:.2},"y":{:.2},"heading":{:.2},"trigger_time":{:.2},"v":{:.2}}}"#,
+            app.park.pos[0], app.park.pos[1], app.park.heading, app.park.trigger_s, app.park.v
+        )
+    } else {
+        "null".to_string()
+    };
 
     format!(
         r#"{{
@@ -122,7 +139,8 @@ pub fn to_json(app: &HudApp) -> String {
   ],
   "mechanisms":[
 {}
-  ]
+  ],
+  "park":{park}
 }}"#,
         MATCH_DURATION as u32,
         segments.join(",\n"),

@@ -37,6 +37,10 @@ fn serialize(app: &HudApp) -> String {
             RobotAction::ShootStop(s)     => format!("\"shoot_stop:{:.4}\"", s),
             RobotAction::ShootMove(s)     => format!("\"shoot_move:{:.4}\"", s),
         };
+        let al = match opts.align {
+            Some(d) => format!(",\"al\":{:.4}", d),
+            None    => String::new(),
+        };
         // Parametri ricerca: [v, larghezza, time_limit, shoot_after, shoot_secs]
         let sr = match seg {
             Segment::Search { search, .. } => format!(
@@ -46,7 +50,7 @@ fn serialize(app: &HudApp) -> String {
             _ => String::new(),
         };
         format!(
-            r#"{{"t":"{type_str}","to":[{:.4},{:.4}],"ctrl":[{ctrls}],"act":{action},"spd":[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}],"rhs":{:.4},"rhe":{:.4},"rs":{:.4}{sr}}}"#,
+            r#"{{"t":"{type_str}","to":[{:.4},{:.4}],"ctrl":[{ctrls}],"act":{action},"spd":[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}],"rhs":{:.4},"rhe":{:.4},"rs":{:.4}{sr}{al}}}"#,
             to[0], to[1],
             opts.speed.v_start, opts.speed.v_max, opts.speed.accel,
             opts.speed.decel, opts.speed.brake_point, opts.speed.v_min,
@@ -68,17 +72,19 @@ fn serialize(app: &HudApp) -> String {
     }).collect();
 
     let hl: Vec<String> = app.highlights.iter().map(|h| {
-        let k = if h.kind == Mechanism::Intake { 0 } else { 1 };
+        let k = match h.kind { Mechanism::Intake => 0, Mechanism::Flywheel => 1, Mechanism::IntakeDown => 2 };
         format!("[{},{:.4},{:.4}]", k, h.from, h.to)
     }).collect();
 
     format!(
-        r#"{{"ver":2,"start":[{:.4},{:.4}],"rh":{:.4},"segs":[{}],"barriers":[{}],"focal":[{}],"hl":[{}]}}"#,
+        r#"{{"ver":2,"start":[{:.4},{:.4}],"rh":{:.4},"segs":[{}],"barriers":[{}],"focal":[{}],"hl":[{}],"park":[{:.4},{:.4},{:.4},{:.4},{:.4},{}]}}"#,
         app.start[0], app.start[1], app.robot_heading,
         segs.join(","),
         barriers.join(","),
         focal.join(","),
         hl.join(","),
+        app.park.pos[0], app.park.pos[1], app.park.heading,
+        app.park.trigger_s, app.park.v, app.park.enabled,
     )
 }
 
@@ -109,6 +115,8 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
                 .collect();
 
             let act_str = s["act"].as_str().unwrap_or("move");
+            // Compatibilità: vecchi salvataggi con "align:gradi" nell'azione
+            let al_from_act = act_str.strip_prefix("align:").and_then(|r| r.parse::<f32>().ok());
             let action = if act_str == "move" {
                 RobotAction::Move
             } else if let Some(rest) = act_str.strip_prefix("wait:") {
@@ -137,6 +145,7 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
                 robot_heading_start: s["rhs"].as_f64().unwrap_or(90.0) as f32,
                 robot_heading_end:   s["rhe"].as_f64().unwrap_or(90.0) as f32,
                 rotation_speed:      s["rs"].as_f64().unwrap_or(180.0) as f32,
+                align:               s["al"].as_f64().map(|x| x as f32).or(al_from_act),
             };
 
             let seg = if s["t"] == "curve" {
@@ -190,7 +199,11 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
     app.highlight_draft = None;
     if let Some(hl) = v["hl"].as_array() {
         for h in hl {
-            let kind = if h[0].as_i64().unwrap_or(0) == 1 { Mechanism::Flywheel } else { Mechanism::Intake };
+            let kind = match h[0].as_i64().unwrap_or(0) {
+                1 => Mechanism::Flywheel,
+                2 => Mechanism::IntakeDown,
+                _ => Mechanism::Intake,
+            };
             let from = h[1].as_f64().unwrap_or(0.0) as f32;
             let to   = h[2].as_f64().unwrap_or(0.0) as f32;
             if to > from {
@@ -198,6 +211,19 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
             }
         }
     }
+
+    let pk = &v["park"];
+    let d = ParkPoint::default();
+    app.park = ParkPoint {
+        pos: [
+            pk[0].as_f64().map(|x| x as f32).unwrap_or(d.pos[0]),
+            pk[1].as_f64().map(|x| x as f32).unwrap_or(d.pos[1]),
+        ],
+        heading:   pk[2].as_f64().map(|x| x as f32).unwrap_or(d.heading),
+        trigger_s: pk[3].as_f64().map(|x| x as f32).unwrap_or(d.trigger_s),
+        v:         pk[4].as_f64().map(|x| x as f32).unwrap_or(d.v),
+        enabled:   pk[5].as_bool().unwrap_or(false),
+    };
 
     Ok(())
 }

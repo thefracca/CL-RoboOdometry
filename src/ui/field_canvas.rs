@@ -31,6 +31,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         if i.key_pressed(egui::Key::Num5) { app.mode = EditMode::AddFocalLine; }
         if i.key_pressed(egui::Key::Num6) { app.mode = EditMode::AddSearch; }
         if i.key_pressed(egui::Key::Num7) { app.mode = EditMode::AddHighlight; }
+        if i.key_pressed(egui::Key::Num8) { app.mode = EditMode::AddPark; }
         // Griglia
         if i.key_pressed(egui::Key::G) { app.hide_grid = !app.hide_grid; }
         // Robot → Start
@@ -44,6 +45,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 app.sim.stop();
                 app.intake_active   = false;
                 app.flywheel_active = false;
+                app.intake_low_active = false;
             } else if !app.segments.is_empty() {
                 app.sim.start(&app.segments);
                 app.robot_pos     = app.start;
@@ -92,6 +94,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         handle_input(&response, &field, app, ui.ctx());
         draw_path(&painter, &field, app);
         draw_highlights(&painter, &field, app);
+        draw_park(&painter, &field, app);
         draw_brake_points(&painter, &field, app);
         draw_barriers(&painter, &field, app);
         draw_barrier_exclusion_zones(&painter, &field, app);
@@ -108,7 +111,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("4", "Barriera"),
     ("5", "Focale"),
     ("6", "Ricerca palline"),
-    ("7", "Evidenzia intake/flywheel"),
+    ("7", "Evidenzia intake/flywheel/giù"),
+    ("8", "Punto parcheggio"),
     ("G", "Griglia + snap ON/OFF"),
     ("Space", "Play / Stop sim"),
     ("Home", "Robot → Start"),
@@ -167,6 +171,8 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                 } else {
                     Dragging::Robot
                 };
+            } else if park_at(pos, field, app) {
+                app.dragging = Dragging::Park;
             } else if let Some((si, ci)) = control_point_at(pos, field, app) {
                 app.dragging = Dragging::ControlPoint(si, ci);
             } else if let Some(ni) = waypoint_at(pos, field, app) {
@@ -234,6 +240,7 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                         }
                     }
                 }
+                Dragging::Park => { app.park.pos = clamped; }
                 Dragging::Highlighting => {
                     if let Some((p, _)) = path_pos_nearest(app, field, pos) {
                         if let Some((a, _)) = app.highlight_draft {
@@ -350,6 +357,13 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                                 search: crate::segment::SearchParams::default(),
                                 opts,
                             });
+                        }
+                    }
+                    EditMode::AddPark => {
+                        if !blocked {
+                            app.park.pos = clamped;
+                            app.park.enabled = true;
+                            app.mode = EditMode::Select;
                         }
                     }
                     EditMode::AddBarrier => {
@@ -729,6 +743,38 @@ fn draw_path(painter: &Painter, field: &FieldView, app: &HudApp) {
     }
 }
 
+fn park_at(pos: Pos2, field: &FieldView, app: &HudApp) -> bool {
+    app.park.enabled
+        && field.to_screen(app.park.pos).distance(pos) <= WAYPOINT_RADIUS + HIT_EXTRA
+}
+
+/// Punto di parcheggio d'emergenza: quadrato azzurro "P" con freccia di heading.
+fn draw_park(painter: &Painter, field: &FieldView, app: &HudApp) {
+    if !app.park.enabled { return; }
+    let sp = field.to_screen(app.park.pos);
+    let r = 11.0;
+    let sq = vec![
+        sp + Vec2::new(-r, -r), sp + Vec2::new(r, -r),
+        sp + Vec2::new(r, r),   sp + Vec2::new(-r, r),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        sq,
+        Color32::from_rgb(40, 160, 200),
+        Stroke::new(1.5, Color32::WHITE),
+    ));
+    painter.text(sp, Align2::CENTER_CENTER, "P", FontId::proportional(14.0), Color32::WHITE);
+    let a = app.park.heading * PI / 180.0;
+    painter.arrow(sp, Vec2::new(a.cos(), -a.sin()) * 26.0,
+        Stroke::new(2.0, Color32::from_rgb(120, 220, 255)));
+    painter.text(
+        sp + Vec2::new(0.0, r + 8.0),
+        Align2::CENTER_CENTER,
+        format!("ultimi {:.0}s", app.park.trigger_s),
+        FontId::proportional(10.0),
+        Color32::from_rgb(120, 220, 255),
+    );
+}
+
 /// Punto del percorso più vicino a `pos` (schermo): (posizione = indice segmento + frazione, distanza px).
 fn path_pos_nearest(app: &HudApp, field: &FieldView, pos: Pos2) -> Option<(f32, f32)> {
     let mut best: Option<(f32, f32)> = None;
@@ -775,6 +821,7 @@ fn draw_highlights(painter: &Painter, field: &FieldView, app: &HudApp) {
     use crate::segment::Mechanism;
     let style = |k: Mechanism, alpha: u8| -> Stroke {
         match k {
+            Mechanism::IntakeDown => Stroke::new(16.0, Color32::from_rgba_unmultiplied(80, 160, 255, alpha.saturating_sub(50))),
             Mechanism::Intake   => Stroke::new(10.0, Color32::from_rgba_unmultiplied(0, 200, 100, alpha)),
             Mechanism::Flywheel => Stroke::new(5.0,  Color32::from_rgba_unmultiplied(255, 160, 0, alpha)),
         }
@@ -786,7 +833,7 @@ fn draw_highlights(painter: &Painter, field: &FieldView, app: &HudApp) {
             painter.add(egui::Shape::line(pts, stroke));
         }
     };
-    for kind in [Mechanism::Intake, Mechanism::Flywheel] {
+    for kind in [Mechanism::IntakeDown, Mechanism::Intake, Mechanism::Flywheel] {
         for h in app.highlights.iter().filter(|h| h.kind == kind) {
             draw(h.from, h.to, style(kind, 150));
         }
@@ -867,6 +914,14 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
             "🔍",
             FontId::proportional(14.0),
             Color32::from_rgb(215, 140, 255),
+        );
+    }
+
+    // Barra / intake abbassato: sbarra blu davanti al robot
+    if app.intake_low_active {
+        painter.line_segment(
+            [rotate(-half, -half - 5.0), rotate(half, -half - 5.0)],
+            Stroke::new(5.0, Color32::from_rgb(80, 160, 255)),
         );
     }
 
@@ -1073,6 +1128,10 @@ fn draw_preview(painter: &Painter, field: &FieldView, app: &HudApp, hover: Optio
                 Stroke::new(1.5, Color32::from_rgba_unmultiplied(190, 120, 255, 160)),
             );
             painter.circle_filled(field.to_screen(fp), 5.0, Color32::from_rgb(190, 120, 255));
+        }
+        EditMode::AddPark => {
+            painter.circle_filled(field.to_screen(fp), 8.0,
+                Color32::from_rgba_unmultiplied(40, 160, 200, 160));
         }
         EditMode::Select | EditMode::AddHighlight => {}
     }

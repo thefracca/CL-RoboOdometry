@@ -1,7 +1,7 @@
 use eframe::egui;
 use crate::{assets, ui};
 use crate::barrier::Barrier;
-use crate::segment::{mechanism_active, Highlight, Mechanism, Segment};
+use crate::segment::{mechanism_active, Highlight, Mechanism, ParkPoint, Segment};
 use crate::simulation::{Simulation, SimState};
 
 #[derive(Clone, Debug)]
@@ -44,6 +44,7 @@ pub enum EditMode {
     AddFocalLine, // primo click = punto A, secondo click = punto B
     AddSearch,    // click = punto di arrivo della ricerca palline
     AddHighlight, // trascina sul percorso per evidenziare un tratto intake/flywheel
+    AddPark,      // click = punto di parcheggio d'emergenza
 }
 
 #[derive(Default, Clone, Debug)]
@@ -60,6 +61,8 @@ pub enum Dragging {
     BrakePoint(usize),
     /// Sta trascinando un tratto evidenziato (bozza in `highlight_draft`)
     Highlighting,
+    /// Trascina il punto di parcheggio
+    Park,
 }
 
 pub struct HudApp {
@@ -82,6 +85,13 @@ pub struct HudApp {
     pub highlights:      Vec<Highlight>,
     pub highlight_kind:  Mechanism,
     pub highlight_draft: Option<(f32, f32)>,
+    /// Barra/intake abbassato in questo momento (solo indicatore)
+    pub intake_low_active: bool,
+    /// Parcheggio d'emergenza (ultimi secondi)
+    pub park: ParkPoint,
+    /// Stato dell'intake bloccato per tutta la durata di un Wait
+    pub wait_hold_intake: bool,
+    pub was_waiting: bool,
 }
 
 impl Default for HudApp {
@@ -106,6 +116,10 @@ impl Default for HudApp {
             highlights:      Vec::new(),
             highlight_kind:  Mechanism::Intake,
             highlight_draft: None,
+            intake_low_active: false,
+            park:             ParkPoint::default(),
+            wait_hold_intake: false,
+            was_waiting:      false,
         }
     }
 }
@@ -138,6 +152,9 @@ impl eframe::App for HudApp {
             self.field_texture = Some(assets::load_field_texture(ctx));
         }
 
+        // Il simulatore deve conoscere il parcheggio d'emergenza
+        self.sim.park = if self.park.enabled { Some(self.park.clone()) } else { None };
+
         // Aggiorna simulazione
         if self.sim.is_running() {
             let dt    = ctx.input(|i| i.unstable_dt).min(0.05);
@@ -146,14 +163,36 @@ impl eframe::App for HudApp {
             if let Some((pos, heading, intake, flywheel)) = self.sim.advance(dt, start, segs) {
                 self.robot_pos       = pos;
                 self.robot_heading   = heading;
-                // Intake / flywheel: dai tratti evidenziati (+ sparo/ricerca della simulazione)
+                // Intake / flywheel / barra: dai tratti evidenziati (+ sparo/ricerca della simulazione)
+                let prev_intake = self.intake_active;
                 let gp = self.sim.seg_index as f32 + self.sim.t;
-                self.intake_active   = intake   || mechanism_active(&self.highlights, Mechanism::Intake,   gp);
-                self.flywheel_active = flywheel || mechanism_active(&self.highlights, Mechanism::Flywheel, gp);
+                let mut in_a = intake   || mechanism_active(&self.highlights, Mechanism::Intake,   gp);
+                let mut fw_a = flywheel || mechanism_active(&self.highlights, Mechanism::Flywheel, gp);
+                let mut low  = mechanism_active(&self.highlights, Mechanism::IntakeDown, gp);
+
+                // Wait: se arriva con l'intake attivo, resta attivo per tutto il wait
+                let waiting = matches!(self.sim.state, SimState::Waiting { .. });
+                if waiting {
+                    if !self.was_waiting {
+                        self.wait_hold_intake = prev_intake || in_a;
+                    }
+                    in_a = self.wait_hold_intake;
+                }
+                self.was_waiting = waiting;
+
+                // Parcheggio d'emergenza: tutto spento
+                if self.sim.state == SimState::Parking {
+                    in_a = false; fw_a = false; low = false;
+                }
+
+                self.intake_active     = in_a;
+                self.flywheel_active   = fw_a;
+                self.intake_low_active = low;
             }
             if self.sim.state == SimState::Finished {
                 self.intake_active   = false;
                 self.flywheel_active = false;
+                self.intake_low_active = false;
             }
             ctx.request_repaint();
         }

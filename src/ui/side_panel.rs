@@ -25,6 +25,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             mode_btn(ui, app, EditMode::AddSearch,   "🔍 Ricerca");
             ui.end_row();
             mode_btn(ui, app, EditMode::AddHighlight,"🖍 Evidenzia");
+            mode_btn(ui, app, EditMode::AddPark,     "🅿 Parcheggio");
             ui.end_row();
         });
         ui.label(RichText::new(match app.mode {
@@ -32,6 +33,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             EditMode::AddLine     => "Click = nodo linea",
             EditMode::AddCurve    => "Click = nodo curva\nDoppio click = +ctrl pt",
             EditMode::AddBarrier  => "Click = vertice\nDoppio click = chiudi\nTasto dx = annulla",
+            EditMode::AddPark     => "Click = punto di parcheggio\nd'emergenza (ultimi secondi)",
             EditMode::AddHighlight=> "Trascina sul percorso per\nevidenziare un tratto\n(tipo scelto sotto)",
             EditMode::AddSearch   => "Click = punto di arrivo\nArea: dall'ultimo punto a qui",
             EditMode::AddFocalLine=> "Click 1 = punto A\nClick 2 = punto B → crea linea",
@@ -57,10 +59,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         // ── Evidenziatore intake / flywheel ──────────────────
         ui.separator();
         ui.label(RichText::new("Evidenziatore").small().strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (k, label, col) in [
-                (Mechanism::Intake,   "INTAKE",   Color32::from_rgb(0, 200, 100)),
-                (Mechanism::Flywheel, "FLYWHEEL", Color32::from_rgb(255, 160, 0)),
+                (Mechanism::Intake,     "INTAKE",     Color32::from_rgb(0, 200, 100)),
+                (Mechanism::Flywheel,   "FLYWHEEL",   Color32::from_rgb(255, 160, 0)),
+                (Mechanism::IntakeDown, "INTAKE GIÙ", Color32::from_rgb(80, 160, 255)),
             ] {
                 let sel = app.highlight_kind == k;
                 let btn = Button::new(RichText::new(label).color(Color32::WHITE).small())
@@ -80,6 +83,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 let (name, col) = match h.kind {
                     Mechanism::Intake   => ("INTAKE",   Color32::from_rgb(0, 200, 100)),
                     Mechanism::Flywheel => ("FLYWHEEL", Color32::from_rgb(255, 160, 0)),
+                    Mechanism::IntakeDown => ("INTAKE GIÙ", Color32::from_rgb(80, 160, 255)),
                 };
                 ui.label(RichText::new(format!("{name} {} → {}", fmt_pos(h.from), fmt_pos(h.to)))
                     .small().color(col));
@@ -87,6 +91,21 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             });
         }
         if let Some(i) = remove_hl { app.highlights.remove(i); }
+
+        // ── Parcheggio d'emergenza ───────────────────────────
+        ui.separator();
+        ui.label(RichText::new("Parcheggio finale").small().strong());
+        ui.checkbox(&mut app.park.enabled, "Attivo");
+        if app.park.enabled {
+            ui.label(RichText::new(format!("P ({:.0}, {:.0})", app.park.pos[0], app.park.pos[1])).small());
+            ui.add(egui::Slider::new(&mut app.park.trigger_s, 1.0..=10.0).text("ultimi s").step_by(0.5));
+            ui.add(egui::Slider::new(&mut app.park.v, 10.0..=300.0).text("v cm/s").step_by(1.0));
+            ui.add(egui::Slider::new(&mut app.park.heading, 0.0..=359.0).text("heading °").step_by(1.0));
+        }
+        if ui.small_button("📍 Imposta punto (tasto 8)").clicked() {
+            app.mode = EditMode::AddPark;
+        }
+        ui.label(RichText::new("Se negli ultimi N s sta ancora eseguendo\nil percorso, lascia tutto e va dritto qui").small().weak());
 
         ui.separator();
 
@@ -122,6 +141,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             indicator(ui, "FLYWHEEL", app.flywheel_active, Color32::from_rgb(255, 160, 0));
         });
         indicator(ui, "🔍 SEARCH", app.sim.state == SimState::Searching, Color32::from_rgb(170, 90, 255));
+        indicator(ui, "⬇ INTAKE GIÙ", app.intake_low_active, Color32::from_rgb(80, 160, 255));
         ui.add_space(4.0);
 
         let remaining = (MATCH_DURATION - app.sim.elapsed).max(0.0);
@@ -144,13 +164,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     ui.label(RichText::new("✅ Percorso completato").color(Color32::GREEN).small());
                 }
             }
-            SimState::Running | SimState::Rotating { .. } | SimState::Waiting { .. } | SimState::ShootStop { .. } | SimState::ShootMove | SimState::Searching => {
+            SimState::Running | SimState::Rotating { .. } | SimState::Waiting { .. } | SimState::ShootStop { .. } | SimState::ShootMove | SimState::Searching
+            | SimState::Aligning { .. } | SimState::Parking => {
                 if ui.add_sized(BTN, Button::new(
                     RichText::new("⏹ Stop").color(Color32::WHITE)
                 ).fill(Color32::from_rgb(180, 50, 50))).clicked() {
                     app.sim.stop();
                     app.intake_active   = false;
                     app.flywheel_active = false;
+                    app.intake_low_active = false;
                 }
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("⏱ {:.1}s", remaining))
@@ -168,6 +190,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     SimState::ShootMove =>
                         ui.label(RichText::new("🎯 SHOOT+MOVE")
                             .color(Color32::from_rgb(255,180,0)).size(14.0)),
+                    SimState::Aligning { current, to, .. } =>
+                        ui.label(RichText::new(format!("↺ ALIGN {:.0}° → {:.0}°", current, to))
+                            .color(Color32::from_rgb(180, 180, 255)).size(14.0)),
+                    SimState::Parking =>
+                        ui.label(RichText::new("🅿 PARCHEGGIO D'EMERGENZA")
+                            .color(Color32::from_rgb(80, 200, 255)).size(14.0)),
                     SimState::Searching => {
                         let (el, lim) = match app.segments.get(app.sim.seg_index) {
                             Some(Segment::Search { search, .. }) => (app.sim.seg_time, search.time_limit),
@@ -282,7 +310,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 let is_wait      = matches!(opts.action, RobotAction::Wait(_));
                 let is_stop      = matches!(opts.action, RobotAction::ShootStop(_));
                 let is_move_shoot= matches!(opts.action, RobotAction::ShootMove(_));
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(
                         matches!(opts.action, RobotAction::Move), "Move"
                     ).clicked() { opts.action = RobotAction::Move; }
@@ -301,6 +329,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                      | RobotAction::ShootMove(secs) = &mut opts.action {
                     ui.add(egui::Slider::new(secs, 0.1..=10.0).text("s").step_by(0.1));
                 }
+                if matches!(opts.action, RobotAction::ShootMove(_)) {
+                    ui.label(RichText::new("Spara per N s dall'inizio; se il segmento\nfinisce prima, si ferma e finisce di sparare").small().weak());
+                }
+                ui.separator();
+                align_ui(ui, opts);
 
 
                 if ui.small_button("✖ elimina segmento").clicked() {
@@ -437,6 +470,20 @@ fn search_ui(
     ui.add(egui::Slider::new(&mut opts.rotation_speed, 10.0..=720.0).text("vel. rot. °/s").step_by(5.0));
 
     ui.separator();
+    align_ui(ui, opts);
+    ui.separator();
+}
+
+/// Align a fine segmento: indipendente dall'azione (si può avere Align + Wait/Shoot).
+fn align_ui(ui: &mut egui::Ui, opts: &mut crate::segment::SegmentOptions) {
+    let mut on = opts.align.is_some();
+    if ui.checkbox(&mut on, "Align a fine segmento").changed() {
+        opts.align = if on { Some(opts.robot_heading_end) } else { None };
+    }
+    if let Some(deg) = &mut opts.align {
+        ui.add(egui::Slider::new(deg, 0.0..=359.0).text("verso °").step_by(1.0));
+        ui.label(RichText::new("Si ferma e gira sul posto (vel. rot. del segmento),\npoi esegue l'azione (wait / sparo)").small().weak());
+    }
 }
 
 /// Posizione lungo il percorso → "#segmento·percentuale"
@@ -468,6 +515,15 @@ fn speed_graph(ui: &mut egui::Ui, app: &HudApp) {
         [egui::Pos2::new(x30, rect.top()), egui::Pos2::new(x30, rect.bottom())],
         egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 80, 80, 120)),
     );
+
+    // Istante in cui scatta il parcheggio d'emergenza
+    if app.park.enabled {
+        let xp = to_p((MATCH_DURATION - app.park.trigger_s).max(0.0), 0.0).x;
+        painter.line_segment(
+            [egui::Pos2::new(xp, rect.top()), egui::Pos2::new(xp, rect.bottom())],
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(80, 200, 255, 160)),
+        );
+    }
 
     let pts: Vec<egui::Pos2> = trace.iter().map(|p| to_p(p[0], p[1])).collect();
     painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, Color32::from_rgb(100, 180, 255))));

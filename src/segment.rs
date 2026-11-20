@@ -3,6 +3,8 @@
 pub enum Mechanism {
     Intake,
     Flywheel,
+    /// Barra / intake abbassato (fuori dal tratto = alzato)
+    IntakeDown,
 }
 
 /// Tratto evidenziato del percorso in cui un meccanismo è attivo.
@@ -15,6 +17,23 @@ pub struct Highlight {
     pub to:   f32,
 }
 
+/// Punto di parcheggio d'emergenza: se negli ultimi `trigger_s` secondi del match il
+/// robot sta ancora eseguendo il percorso, lascia tutto e va dritto qui.
+#[derive(Clone, Debug)]
+pub struct ParkPoint {
+    pub pos:       [f32; 2],
+    pub heading:   f32,
+    pub enabled:   bool,
+    pub trigger_s: f32,
+    pub v:         f32, // cm/s, velocità costante
+}
+
+impl Default for ParkPoint {
+    fn default() -> Self {
+        Self { pos: [300.0, 60.0], heading: 90.0, enabled: false, trigger_s: 4.0, v: 100.0 }
+    }
+}
+
 /// Il meccanismo `kind` è attivo alla posizione `p` lungo il percorso?
 pub fn mechanism_active(highlights: &[Highlight], kind: Mechanism, p: f32) -> bool {
     highlights.iter().any(|h| h.kind == kind && p >= h.from && p <= h.to)
@@ -25,7 +44,7 @@ pub enum RobotAction {
     Move,
     Wait(f32),       // attendi N secondi fermo (senza sparare)
     ShootStop(f32),  // spara fermo per N secondi
-    ShootMove(f32),  // spara mentre si muove
+    ShootMove(f32),  // spara per N s dall'inizio del segmento; se il segmento finisce prima, si ferma e finisce di sparare
 }
 
 impl Default for RobotAction {
@@ -68,6 +87,9 @@ pub struct SegmentOptions {
     /// Velocità di rotazione (°/s) usata per ruotare dall'heading_end del segmento
     /// precedente all'heading_start di questo segmento (fase Rotating tra segmenti).
     pub rotation_speed: f32,
+    /// Align (indipendente dall'azione): a fine segmento il robot si ferma e ruota
+    /// sul posto fino a questo heading (gradi); poi esegue l'azione del segmento.
+    pub align: Option<f32>,
 }
 
 impl Default for SegmentOptions {
@@ -78,6 +100,7 @@ impl Default for SegmentOptions {
             robot_heading_start: 90.0,
             robot_heading_end:   90.0,
             rotation_speed:      180.0, // °/s default
+            align:               None,
         }
     }
 }
