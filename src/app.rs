@@ -91,7 +91,10 @@ pub struct HudApp {
     pub park: ParkPoint,
     /// Stato dell'intake bloccato per tutta la durata di un Wait
     pub wait_hold_intake: bool,
+    pub wait_hold_shoot: bool,
     pub was_waiting: bool,
+    /// Sparo attivo in questo momento (solo indicatore; implica flywheel)
+    pub shoot_active: bool,
 }
 
 impl Default for HudApp {
@@ -119,7 +122,9 @@ impl Default for HudApp {
             intake_low_active: false,
             park:             ParkPoint::default(),
             wait_hold_intake: false,
+            wait_hold_shoot:  false,
             was_waiting:      false,
+            shoot_active:     false,
         }
     }
 }
@@ -131,11 +136,20 @@ impl HudApp {
         self.segments.remove(i);
         let fi = i as f32;
         let map = |p: f32| if p >= fi + 1.0 { p - 1.0 } else if p > fi { fi } else { p };
-        for h in &mut self.highlights {
+        let old = std::mem::take(&mut self.highlights);
+        for mut h in old {
+            let is_point = h.to - h.from < 1e-4;
+            // un punto di sparo sul nodo di arrivo del segmento rimosso sparisce con lui
+            if is_point && h.from > fi && h.from < fi + 1.0 + 1e-3 { continue; }
             h.from = map(h.from);
             h.to   = map(h.to);
+            if is_point {
+                h.to = h.from;
+                self.highlights.push(h);
+            } else if h.to - h.from > 0.01 {
+                self.highlights.push(h);
+            }
         }
-        self.highlights.retain(|h| h.to - h.from > 0.01);
     }
 
     /// Cancella tutto il percorso (e i tratti evidenziati, che ne dipendono).
@@ -154,6 +168,11 @@ impl eframe::App for HudApp {
 
         // Il simulatore deve conoscere il parcheggio d'emergenza
         self.sim.park = if self.park.enabled { Some(self.park.clone()) } else { None };
+        // Punti di sparo (from == to): il simulatore si ferma lì e spara per `secs`
+        self.sim.shoot_points = self.highlights.iter()
+            .filter(|h| h.kind == Mechanism::Shoot && h.to - h.from < 1e-4)
+            .map(|h| (h.from, h.secs))
+            .collect();
 
         // Aggiorna simulazione
         if self.sim.is_running() {
@@ -165,34 +184,42 @@ impl eframe::App for HudApp {
                 self.robot_heading   = heading;
                 // Intake / flywheel / barra: dai tratti evidenziati (+ sparo/ricerca della simulazione)
                 let prev_intake = self.intake_active;
+                let prev_shoot  = self.shoot_active;
                 let gp = self.sim.seg_index as f32 + self.sim.t;
                 let mut in_a = intake   || mechanism_active(&self.highlights, Mechanism::Intake,   gp);
                 let mut fw_a = flywheel || mechanism_active(&self.highlights, Mechanism::Flywheel, gp);
                 let mut low  = mechanism_active(&self.highlights, Mechanism::IntakeDown, gp);
+                let mut sh   = self.sim.is_shooting()
+                    || mechanism_active(&self.highlights, Mechanism::Shoot, gp);
 
-                // Wait: se arriva con l'intake attivo, resta attivo per tutto il wait
+                // Wait: se arriva con intake / sparo attivi, restano attivi per tutto il wait
                 let waiting = matches!(self.sim.state, SimState::Waiting { .. });
                 if waiting {
                     if !self.was_waiting {
                         self.wait_hold_intake = prev_intake || in_a;
+                        self.wait_hold_shoot  = prev_shoot  || sh;
                     }
                     in_a = self.wait_hold_intake;
+                    sh   = self.wait_hold_shoot;
                 }
                 self.was_waiting = waiting;
 
                 // Parcheggio d'emergenza: tutto spento
                 if self.sim.state == SimState::Parking {
-                    in_a = false; fw_a = false; low = false;
+                    in_a = false; fw_a = false; low = false; sh = false;
                 }
+                if sh { fw_a = true; } // lo sparo implica flywheel
 
                 self.intake_active     = in_a;
                 self.flywheel_active   = fw_a;
                 self.intake_low_active = low;
+                self.shoot_active      = sh;
             }
             if self.sim.state == SimState::Finished {
                 self.intake_active   = false;
                 self.flywheel_active = false;
                 self.intake_low_active = false;
+                self.shoot_active = false;
             }
             ctx.request_repaint();
         }

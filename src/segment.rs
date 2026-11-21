@@ -5,6 +5,9 @@ pub enum Mechanism {
     Flywheel,
     /// Barra / intake abbassato (fuori dal tratto = alzato)
     IntakeDown,
+    /// Sparo. Trascinato = spara mentre si muove nel tratto.
+    /// Click su un nodo (tratto di lunghezza zero) = il robot, arrivato lì, si ferma e spara per `secs`.
+    Shoot,
 }
 
 /// Tratto evidenziato del percorso in cui un meccanismo è attivo.
@@ -15,6 +18,8 @@ pub struct Highlight {
     pub kind: Mechanism,
     pub from: f32,
     pub to:   f32,
+    /// Durata dello sparo (s) — usata solo dai punti Shoot (from == to)
+    pub secs: f32,
 }
 
 /// Punto di parcheggio d'emergenza: se negli ultimi `trigger_s` secondi del match il
@@ -36,7 +41,8 @@ impl Default for ParkPoint {
 
 /// Il meccanismo `kind` è attivo alla posizione `p` lungo il percorso?
 pub fn mechanism_active(highlights: &[Highlight], kind: Mechanism, p: f32) -> bool {
-    highlights.iter().any(|h| h.kind == kind && p >= h.from && p <= h.to)
+    // i punti (from == to) non sono "tratti": non restano attivi mentre il robot passa/sta lì
+    highlights.iter().any(|h| h.kind == kind && h.to - h.from > 1e-4 && p >= h.from && p <= h.to)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,7 +180,7 @@ impl Segment {
                 (0..=n).map(|i| {
                     let t = i as f32 / n as f32;
                     [from[0] + t * (to[0] - from[0]),
-                     from[1] + t * (to[1] - from[1])]
+                        from[1] + t * (to[1] - from[1])]
                 }).collect()
             }
             Segment::Curve { controls, to, .. } => {
@@ -189,7 +195,7 @@ impl Segment {
                     let t = i as f32 / n as f32;
                     let u = 1.0 - t;
                     [u*u*u*p0[0] + 3.0*u*u*t*p1[0] + 3.0*u*t*t*p2[0] + t*t*t*p3[0],
-                     u*u*u*p0[1] + 3.0*u*u*t*p1[1] + 3.0*u*t*t*p2[1] + t*t*t*p3[1]]
+                        u*u*u*p0[1] + 3.0*u*u*t*p1[1] + 3.0*u*t*t*p2[1] + t*t*t*p3[1]]
                 }).collect()
             }
         }

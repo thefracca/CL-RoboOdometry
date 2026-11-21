@@ -46,6 +46,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 app.intake_active   = false;
                 app.flywheel_active = false;
                 app.intake_low_active = false;
+                app.shoot_active = false;
             } else if !app.segments.is_empty() {
                 app.sim.start(&app.segments);
                 app.robot_pos     = app.start;
@@ -111,7 +112,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("4", "Barriera"),
     ("5", "Focale"),
     ("6", "Ricerca palline"),
-    ("7", "Evidenzia intake/flywheel/giù"),
+    ("7", "Evidenzia intake/flywheel/giù/sparo"),
     ("8", "Punto parcheggio"),
     ("G", "Griglia + snap ON/OFF"),
     ("Space", "Play / Stop sim"),
@@ -283,7 +284,7 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                     let (f, t) = if a <= b { (a, b) } else { (b, a) };
                     if t - f > 0.01 {
                         let kind = app.highlight_kind;
-                        app.highlights.push(crate::segment::Highlight { kind, from: f, to: t });
+                        app.highlights.push(crate::segment::Highlight { kind, from: f, to: t, secs: 1.0 });
                     }
                 }
             }
@@ -312,7 +313,27 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                 || control_point_at(pos, field, app).is_some()
                 || barrier_vertex_at(pos, field, app).is_some();
 
-            if !on_existing {
+            if app.mode == EditMode::AddHighlight {
+                // Sparo puntuale: solo sui NODI del percorso (arrivo di un segmento, start escluso)
+                if app.highlight_kind == crate::segment::Mechanism::Shoot {
+                    if let Some(ni) = waypoint_at(pos, field, app) {
+                        if ni >= 1 {
+                            let p = ni as f32;
+                            let exists = app.highlights.iter().any(|h| {
+                                h.kind == crate::segment::Mechanism::Shoot
+                                    && h.to - h.from < 1e-4
+                                    && (h.from - p).abs() < 1e-3
+                            });
+                            if !exists {
+                                app.highlights.push(crate::segment::Highlight {
+                                    kind: crate::segment::Mechanism::Shoot,
+                                    from: p, to: p, secs: 1.0,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else if !on_existing {
                 let blocked = point_blocked_by_barrier(clamped, app);
                 match app.mode {
                     EditMode::AddLine => {
@@ -816,11 +837,27 @@ fn highlight_points(app: &HudApp, from: f32, to: f32) -> Vec<[f32; 2]> {
     out
 }
 
+/// Punto (cm) del percorso alla posizione `p` (indice segmento + frazione).
+fn path_point_at(app: &HudApp, p: f32) -> Option<[f32; 2]> {
+    let n = app.segments.len();
+    if n == 0 { return None; }
+    let (i, t) = if p >= n as f32 {
+        (n - 1, 1.0)
+    } else {
+        let i = p.floor().max(0.0) as usize;
+        (i, p - i as f32)
+    };
+    let prev = if i == 0 { app.start } else { app.segments[i - 1].end() };
+    let pts = app.segments[i].sample(prev, 60);
+    Some(crate::simulation::point_at_fraction(&pts, t.clamp(0.0, 1.0)))
+}
+
 /// Tratti evidenziati (intake verde largo, flywheel arancione stretto sopra) + bozza in corso.
 fn draw_highlights(painter: &Painter, field: &FieldView, app: &HudApp) {
     use crate::segment::Mechanism;
     let style = |k: Mechanism, alpha: u8| -> Stroke {
         match k {
+            Mechanism::Shoot      => Stroke::new(3.0, Color32::from_rgba_unmultiplied(255, 70, 70, alpha)),
             Mechanism::IntakeDown => Stroke::new(16.0, Color32::from_rgba_unmultiplied(80, 160, 255, alpha.saturating_sub(50))),
             Mechanism::Intake   => Stroke::new(10.0, Color32::from_rgba_unmultiplied(0, 200, 100, alpha)),
             Mechanism::Flywheel => Stroke::new(5.0,  Color32::from_rgba_unmultiplied(255, 160, 0, alpha)),
@@ -833,9 +870,24 @@ fn draw_highlights(painter: &Painter, field: &FieldView, app: &HudApp) {
             painter.add(egui::Shape::line(pts, stroke));
         }
     };
-    for kind in [Mechanism::IntakeDown, Mechanism::Intake, Mechanism::Flywheel] {
-        for h in app.highlights.iter().filter(|h| h.kind == kind) {
+    for kind in [Mechanism::IntakeDown, Mechanism::Intake, Mechanism::Flywheel, Mechanism::Shoot] {
+        for h in app.highlights.iter().filter(|h| h.kind == kind && h.to - h.from > 1e-4) {
             draw(h.from, h.to, style(kind, 150));
+        }
+    }
+    // Sparo puntuale: il robot si ferma qui e spara per N secondi
+    for h in app.highlights.iter().filter(|h| h.kind == Mechanism::Shoot && h.to - h.from < 1e-4) {
+        if let Some(p) = path_point_at(app, h.from) {
+            let sp = field.to_screen(p);
+            painter.circle_filled(sp, 8.0, Color32::from_rgba_unmultiplied(255, 70, 70, 190));
+            painter.circle_stroke(sp, 8.0, Stroke::new(1.5, Color32::WHITE));
+            painter.text(
+                sp + Vec2::new(0.0, -16.0),
+                Align2::CENTER_CENTER,
+                format!("🎯 {:.1}s", h.secs),
+                FontId::proportional(11.0),
+                Color32::from_rgb(255, 150, 150),
+            );
         }
     }
     if let Some((a, b)) = app.highlight_draft {
@@ -925,8 +977,8 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
         );
     }
 
-    // Indicatore ShootMove — cerchio rosso pulsante attorno al robot
-    if app.sim.state == crate::simulation::SimState::ShootMove {
+    // Indicatore sparo — cerchio rosso pulsante attorno al robot
+    if app.shoot_active {
         let t = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

@@ -64,6 +64,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 (Mechanism::Intake,     "INTAKE",     Color32::from_rgb(0, 200, 100)),
                 (Mechanism::Flywheel,   "FLYWHEEL",   Color32::from_rgb(255, 160, 0)),
                 (Mechanism::IntakeDown, "INTAKE GIÙ", Color32::from_rgb(80, 160, 255)),
+                (Mechanism::Shoot,      "SPARO",      Color32::from_rgb(255, 70, 70)),
             ] {
                 let sel = app.highlight_kind == k;
                 let btn = Button::new(RichText::new(label).color(Color32::WHITE).small())
@@ -74,19 +75,29 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 }
             }
         });
+        if app.highlight_kind == Mechanism::Shoot {
+            ui.label(RichText::new("SPARO: trascina = spara mentre si muove;\nclick su un NODO = si ferma lì e spara").small().weak());
+        }
         if app.highlights.is_empty() {
             ui.label(RichText::new("(nessun tratto evidenziato)").small().weak());
         }
         let mut remove_hl: Option<usize> = None;
-        for (i, h) in app.highlights.iter().enumerate() {
+        for (i, h) in app.highlights.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 let (name, col) = match h.kind {
                     Mechanism::Intake   => ("INTAKE",   Color32::from_rgb(0, 200, 100)),
                     Mechanism::Flywheel => ("FLYWHEEL", Color32::from_rgb(255, 160, 0)),
                     Mechanism::IntakeDown => ("INTAKE GIÙ", Color32::from_rgb(80, 160, 255)),
+                    Mechanism::Shoot      => ("SPARO",      Color32::from_rgb(255, 70, 70)),
                 };
-                ui.label(RichText::new(format!("{name} {} → {}", fmt_pos(h.from), fmt_pos(h.to)))
-                    .small().color(col));
+                if h.to - h.from < 1e-4 {
+                    // punto di sparo: si ferma e spara per N secondi
+                    ui.label(RichText::new(format!("{name} ● {}", fmt_pos(h.from))).small().color(col));
+                    ui.add(egui::Slider::new(&mut h.secs, 0.1..=10.0).text("s").step_by(0.1));
+                } else {
+                    ui.label(RichText::new(format!("{name} {} → {}", fmt_pos(h.from), fmt_pos(h.to)))
+                        .small().color(col));
+                }
                 if ui.small_button("✖").clicked() { remove_hl = Some(i); }
             });
         }
@@ -142,6 +153,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         });
         indicator(ui, "🔍 SEARCH", app.sim.state == SimState::Searching, Color32::from_rgb(170, 90, 255));
         indicator(ui, "⬇ INTAKE GIÙ", app.intake_low_active, Color32::from_rgb(80, 160, 255));
+        indicator(ui, "🎯 SHOOT", app.shoot_active, Color32::from_rgb(255, 70, 70));
         ui.add_space(4.0);
 
         let remaining = (MATCH_DURATION - app.sim.elapsed).max(0.0);
@@ -165,7 +177,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 }
             }
             SimState::Running | SimState::Rotating { .. } | SimState::Waiting { .. } | SimState::ShootStop { .. } | SimState::ShootMove | SimState::Searching
-            | SimState::Aligning { .. } | SimState::Parking => {
+            | SimState::Aligning { .. } | SimState::Parking | SimState::ShootHold { .. } => {
                 if ui.add_sized(BTN, Button::new(
                     RichText::new("⏹ Stop").color(Color32::WHITE)
                 ).fill(Color32::from_rgb(180, 50, 50))).clicked() {
@@ -173,6 +185,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     app.intake_active   = false;
                     app.flywheel_active = false;
                     app.intake_low_active = false;
+                    app.shoot_active = false;
                 }
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("⏱ {:.1}s", remaining))
@@ -184,15 +197,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     SimState::Waiting { remaining } =>
                         ui.label(RichText::new(format!("⏸ WAIT {:.1}s", remaining))
                             .color(Color32::from_rgb(150, 150, 255)).size(14.0)),
-                    SimState::ShootStop { remaining } =>
-                        ui.label(RichText::new(format!("🎯 SHOOT+STOP {:.1}s", remaining))
-                            .color(Color32::YELLOW).size(14.0)),
-                    SimState::ShootMove =>
-                        ui.label(RichText::new("🎯 SHOOT+MOVE")
-                            .color(Color32::from_rgb(255,180,0)).size(14.0)),
                     SimState::Aligning { current, to, .. } =>
                         ui.label(RichText::new(format!("↺ ALIGN {:.0}° → {:.0}°", current, to))
                             .color(Color32::from_rgb(180, 180, 255)).size(14.0)),
+                    SimState::ShootHold { remaining, .. } =>
+                        ui.label(RichText::new(format!("🎯 SPARO (punto) {:.1}s", remaining))
+                            .color(Color32::from_rgb(255, 90, 90)).size(14.0)),
                     SimState::Parking =>
                         ui.label(RichText::new("🅿 PARCHEGGIO D'EMERGENZA")
                             .color(Color32::from_rgb(80, 200, 255)).size(14.0)),
@@ -308,8 +318,6 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 // Azione
                 ui.label(RichText::new("Azione").small().strong());
                 let is_wait      = matches!(opts.action, RobotAction::Wait(_));
-                let is_stop      = matches!(opts.action, RobotAction::ShootStop(_));
-                let is_move_shoot= matches!(opts.action, RobotAction::ShootMove(_));
                 ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(
                         matches!(opts.action, RobotAction::Move), "Move"
@@ -317,21 +325,11 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     if ui.selectable_label(is_wait, "Wait").clicked() {
                         opts.action = RobotAction::Wait(1.0);
                     }
-                    if ui.selectable_label(is_stop, "Shoot+Stop").clicked() {
-                        opts.action = RobotAction::ShootStop(1.0);
-                    }
-                    if ui.selectable_label(is_move_shoot, "Shoot+Move").clicked() {
-                        opts.action = RobotAction::ShootMove(1.0);
-                    }
                 });
-                if let RobotAction::Wait(secs)
-                     | RobotAction::ShootStop(secs)
-                     | RobotAction::ShootMove(secs) = &mut opts.action {
+                if let RobotAction::Wait(secs) = &mut opts.action {
                     ui.add(egui::Slider::new(secs, 0.1..=10.0).text("s").step_by(0.1));
                 }
-                if matches!(opts.action, RobotAction::ShootMove(_)) {
-                    ui.label(RichText::new("Spara per N s dall'inizio; se il segmento\nfinisce prima, si ferma e finisce di sparare").small().weak());
-                }
+
                 ui.separator();
                 align_ui(ui, opts);
 

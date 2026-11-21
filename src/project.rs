@@ -68,12 +68,12 @@ fn serialize(app: &HudApp) -> String {
 
     let focal: Vec<String> = app.focal_lines.iter().map(|f| {
         format!("[{:.4},{:.4},{:.4},{:.4},{:.4},{}]",
-            f.a[0], f.a[1], f.b[0], f.b[1], f.snap_radius_cm, f.visible)
+                f.a[0], f.a[1], f.b[0], f.b[1], f.snap_radius_cm, f.visible)
     }).collect();
 
     let hl: Vec<String> = app.highlights.iter().map(|h| {
-        let k = match h.kind { Mechanism::Intake => 0, Mechanism::Flywheel => 1, Mechanism::IntakeDown => 2 };
-        format!("[{},{:.4},{:.4}]", k, h.from, h.to)
+        let k = match h.kind { Mechanism::Intake => 0, Mechanism::Flywheel => 1, Mechanism::IntakeDown => 2, Mechanism::Shoot => 3 };
+        format!("[{},{:.4},{:.4},{:.4}]", k, h.from, h.to, h.secs)
     }).collect();
 
     format!(
@@ -111,7 +111,7 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
                 .unwrap_or(&vec![])
                 .iter()
                 .map(|c| [c[0].as_f64().unwrap_or(0.0) as f32,
-                           c[1].as_f64().unwrap_or(0.0) as f32])
+                    c[1].as_f64().unwrap_or(0.0) as f32])
                 .collect();
 
             let act_str = s["act"].as_str().unwrap_or("move");
@@ -202,12 +202,15 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
             let kind = match h[0].as_i64().unwrap_or(0) {
                 1 => Mechanism::Flywheel,
                 2 => Mechanism::IntakeDown,
+                3 => Mechanism::Shoot,
                 _ => Mechanism::Intake,
             };
             let from = h[1].as_f64().unwrap_or(0.0) as f32;
             let to   = h[2].as_f64().unwrap_or(0.0) as f32;
-            if to > from {
-                app.highlights.push(Highlight { kind, from, to });
+            let secs = h[3].as_f64().unwrap_or(1.0) as f32;
+            // i punti di sparo hanno from == to
+            if to > from || (kind == Mechanism::Shoot && to == from) {
+                app.highlights.push(Highlight { kind, from, to, secs });
             }
         }
     }

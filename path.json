@@ -5,22 +5,84 @@
   "segments":[
     {
       "id":0,
+      "type":"line",
+      "to":{"x":182.88,"y":322.37},
+      "robot_heading":{
+        "start":90.00,
+        "end":90.00,
+        "rotation_speed":180.00
+      },
+      "speed":{
+        "v_start":0.00,
+        "v_max":80.00,
+        "v_min":25.00,
+        "accel":120.00,
+        "decel":200.00,
+        "brake_point":0.7500
+      },
+      "action":"move",
+      "align":null
+    },
+    {
+      "id":1,
+      "type":"curve",
+      "to":{"x":316.61,"y":280.90},
+      "controls":[{"x":254.02,"y":342.26}],
+      "robot_heading":{
+        "start":90.00,
+        "end":90.00,
+        "rotation_speed":180.00
+      },
+      "speed":{
+        "v_start":0.00,
+        "v_max":80.00,
+        "accel":120.00
+      },
+      "action":"move",
+      "align":null
+    },
+    {
+      "id":2,
       "type":"search",
-      "to":{"x":185.58,"y":304.71},
+      "to":{"x":316.61,"y":160.32},
       "search":{
         "v":60.00,
         "area_width":60.00,
-        "time_limit":5.00,
-        "shoot_after":true,
-        "shoot_time":4.00
+        "time_limit":9.00,
+        "shoot_after":false,
+        "shoot_time":1.00
       },
       "robot_heading":{
         "start":90.00,
-        "end":90.00
+        "end":90.00,
+        "rotation_speed":180.00
       },
       "action":"move",
-      "intake":true,
-      "flywheel":false
+      "align":null
+    },
+    {
+      "id":3,
+      "type":"line",
+      "to":{"x":287.06,"y":104.63},
+      "robot_heading":{
+        "start":90.00,
+        "end":90.00,
+        "rotation_speed":180.00
+      },
+      "speed":{
+        "v_start":0.00,
+        "v_max":80.00,
+        "v_min":25.00,
+        "accel":120.00,
+        "decel":200.00,
+        "brake_point":0.7500
+      },
+      "action":{"wait":10.00},
+      "align":180.00
     }
-  ]
+  ],
+  "mechanisms":[
+
+  ],
+  "park":{"x":323.38,"y":46.51,"heading":90.00,"trigger_time":4.00,"v":100.00}
 }

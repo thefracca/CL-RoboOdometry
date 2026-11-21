@@ -111,7 +111,15 @@ pub fn to_json(app: &HudApp) -> String {
             Mechanism::Intake   => "intake",
             Mechanism::Flywheel => "flywheel",
             Mechanism::IntakeDown => "intake_down",
+            Mechanism::Shoot      => "shoot",
         };
+        // Sparo puntuale su un nodo: finito il segmento `after_segment` il robot si ferma e spara `time` s
+        if h.kind == Mechanism::Shoot && h.to - h.from < 1e-4 {
+            return format!(
+                r#"    {{"type":"shoot_point","after_segment":{},"time":{:.2}}}"#,
+                (h.from.round().max(1.0) as usize) - 1, h.secs
+            );
+        }
         format!(
             r#"    {{"type":"{kind}","from":{},"to":{}}}"#,
             pos_json(h.from, n),

@@ -1,1 +1,16 @@
+# Build Rust
 /target
+
+# Documentazione di sviluppo
+DOCUMENTAZIONE_SVILUPPO.md
+
+progetto.hudproject
+path.json
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# File di sistema
+.DS_Store
+Thumbs.db

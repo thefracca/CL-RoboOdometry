@@ -22,6 +22,8 @@ pub enum SimState {
     Aligning { to: f32, current: f32, speed: f32 },
     /// Failsafe: ultimi secondi, lascia tutto e va dritto al punto di parcheggio
     Parking,
+    /// Punto di sparo su un nodo: il robot è fermo a fine segmento e spara, poi esegue l'azione.
+    ShootHold { remaining: f32 },
     Finished,
 }
 
@@ -44,6 +46,8 @@ pub struct Simulation {
     pub park:      Option<ParkPoint>,
     pub park_from: [f32; 2],
     pub park_from_heading: f32,
+    /// Punti di sparo sui nodi: (numero del nodo = arrivo del segmento n-1, secondi)
+    pub shoot_points: Vec<(f32, f32)>,
 }
 
 // ════════════════════════════════════════════════════════════
@@ -200,6 +204,12 @@ impl Simulation {
         !matches!(self.state, SimState::Idle | SimState::Finished)
     }
 
+    /// Il robot sta sparando in questo momento (sparo da fermo / in movimento / da punto).
+    pub fn is_shooting(&self) -> bool {
+        matches!(self.state,
+            SimState::ShootStop { .. } | SimState::ShootMove | SimState::ShootHold { .. })
+    }
+
     pub fn is_rotating(&self) -> bool {
         matches!(self.state, SimState::Rotating { .. })
     }
@@ -226,6 +236,9 @@ impl Simulation {
         let o = segments[i].opts();
         let heading = match &self.state {
             SimState::Rotating { current, .. } | SimState::Aligning { current, .. } => *current,
+            // da fermo a fine segmento: l'heading è quello finale (anche dopo un Align)
+            SimState::Waiting { .. } | SimState::ShootStop { .. }
+            | SimState::ShootHold { .. } => end_heading(&segments[i]),
             _ => interp_heading(o.robot_heading_start, o.robot_heading_end, self.t),
         };
         (pos, heading)
@@ -247,8 +260,8 @@ impl Simulation {
     /// Pose da fermo: fine del segmento corrente.
     fn hold_pose(&self, segments: &[Segment], shooting: bool) -> ([f32; 2], f32, bool, bool) {
         let i = self.seg_index.min(segments.len() - 1);
-        let o = segments[i].opts();
-        (segments[i].end(), o.robot_heading_end, false, shooting)
+        // Heading finale reale (se c'è un Align è quello di arrivo dell'Align)
+        (segments[i].end(), end_heading(&segments[i]), false, shooting)
     }
 
     pub fn advance(
@@ -323,11 +336,20 @@ impl Simulation {
             let pos = segments[self.seg_index.min(segments.len() - 1)].end();
             if delta.abs() <= step {
                 let final_h = *to;
-                self.run_action(segments); // finito l'align: azione del segmento (wait/sparo) o avanti
+                self.after_align(segments); // finito l'align: eventuale sparo puntuale, poi l'azione
                 return Some((pos, final_h, false, false));
             }
             *current = (*current + step * delta.signum()).rem_euclid(360.0);
             return Some((pos, *current, false, false));
+        }
+
+        // ── ShootHold: fermo su un nodo, spara (punto di sparo) ──
+        if let SimState::ShootHold { remaining } = &mut self.state {
+            *remaining -= dt;
+            let done = *remaining <= 0.0;
+            let out = self.hold_pose(segments, true);
+            if done { self.run_action(segments); } // poi l'azione del segmento (wait/sparo/avanti)
+            return Some(out);
         }
 
         // ── Wait: fermo senza sparare ─────────────────────────
@@ -424,7 +446,20 @@ impl Simulation {
                 return;
             }
         }
-        self.run_action(segments);
+        self.after_align(segments);
+    }
+
+    /// Dopo l'eventuale align: se qui c'è un punto di sparo si ferma e spara, poi l'azione.
+    fn after_align(&mut self, segments: &[Segment]) {
+        let p = (self.seg_index + 1) as f32;
+        let secs = self.shoot_points.iter()
+            .find(|(q, _)| (q - p).abs() < 1e-3)
+            .map(|(_, s)| *s);
+        if let Some(secs) = secs {
+            self.state = SimState::ShootHold { remaining: secs.max(0.0) };
+        } else {
+            self.run_action(segments);
+        }
     }
 
     /// Azione di fine segmento (dopo l'eventuale align).
