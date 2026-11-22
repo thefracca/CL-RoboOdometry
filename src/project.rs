@@ -34,8 +34,6 @@ fn serialize(app: &HudApp) -> String {
         let action = match &opts.action {
             RobotAction::Move             => "\"move\"".to_string(),
             RobotAction::Wait(s)          => format!("\"wait:{:.4}\"", s),
-            RobotAction::ShootStop(s)     => format!("\"shoot_stop:{:.4}\"", s),
-            RobotAction::ShootMove(s)     => format!("\"shoot_move:{:.4}\"", s),
         };
         let al = match opts.align {
             Some(d) => format!(",\"al\":{:.4}", d),
@@ -50,12 +48,11 @@ fn serialize(app: &HudApp) -> String {
             _ => String::new(),
         };
         format!(
-            r#"{{"t":"{type_str}","to":[{:.4},{:.4}],"ctrl":[{ctrls}],"act":{action},"spd":[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}],"rhs":{:.4},"rhe":{:.4},"rs":{:.4}{sr}{al}}}"#,
+            r#"{{"t":"{type_str}","to":[{:.4},{:.4}],"ctrl":[{ctrls}],"act":{action},"spd":[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}],"rhs":{:.4},"rhe":{:.4}{sr}{al}}}"#,
             to[0], to[1],
             opts.speed.v_start, opts.speed.v_max, opts.speed.accel,
             opts.speed.decel, opts.speed.brake_point, opts.speed.v_min,
             opts.robot_heading_start, opts.robot_heading_end,
-            opts.rotation_speed,
         )
     }).collect();
 
@@ -68,12 +65,12 @@ fn serialize(app: &HudApp) -> String {
 
     let focal: Vec<String> = app.focal_lines.iter().map(|f| {
         format!("[{:.4},{:.4},{:.4},{:.4},{:.4},{}]",
-                f.a[0], f.a[1], f.b[0], f.b[1], f.snap_radius_cm, f.visible)
+            f.a[0], f.a[1], f.b[0], f.b[1], f.snap_radius_cm, f.visible)
     }).collect();
 
     let hl: Vec<String> = app.highlights.iter().map(|h| {
-        let k = match h.kind { Mechanism::Intake => 0, Mechanism::Flywheel => 1, Mechanism::IntakeDown => 2, Mechanism::Shoot => 3 };
-        format!("[{},{:.4},{:.4},{:.4}]", k, h.from, h.to, h.secs)
+        let k = match h.kind { Mechanism::Intake => 0, Mechanism::Flywheel => 1, Mechanism::IntakeDown => 2, Mechanism::Shoot => 3, Mechanism::BarDown => 4 };
+        format!("[{},{:.4},{:.4},{:.4},{:.4}]", k, h.from, h.to, h.secs, h.delay)
     }).collect();
 
     format!(
@@ -111,7 +108,7 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
                 .unwrap_or(&vec![])
                 .iter()
                 .map(|c| [c[0].as_f64().unwrap_or(0.0) as f32,
-                    c[1].as_f64().unwrap_or(0.0) as f32])
+                           c[1].as_f64().unwrap_or(0.0) as f32])
                 .collect();
 
             let act_str = s["act"].as_str().unwrap_or("move");
@@ -122,9 +119,8 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
             } else if let Some(rest) = act_str.strip_prefix("wait:") {
                 RobotAction::Wait(rest.parse().unwrap_or(1.0))
             } else if let Some(rest) = act_str.strip_prefix("shoot_stop:") {
-                RobotAction::ShootStop(rest.parse().unwrap_or(1.0))
-            } else if let Some(rest) = act_str.strip_prefix("shoot_move:") {
-                RobotAction::ShootMove(rest.parse().unwrap_or(1.0))
+                // compatibilità: il vecchio Shoot+Stop diventa un Wait della stessa durata
+                RobotAction::Wait(rest.parse().unwrap_or(1.0))
             } else {
                 RobotAction::Move
             };
@@ -144,7 +140,6 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
                 action,
                 robot_heading_start: s["rhs"].as_f64().unwrap_or(90.0) as f32,
                 robot_heading_end:   s["rhe"].as_f64().unwrap_or(90.0) as f32,
-                rotation_speed:      s["rs"].as_f64().unwrap_or(180.0) as f32,
                 align:               s["al"].as_f64().map(|x| x as f32).or(al_from_act),
             };
 
@@ -203,14 +198,16 @@ fn deserialize(app: &mut HudApp, text: &str) -> Result<(), String> {
                 1 => Mechanism::Flywheel,
                 2 => Mechanism::IntakeDown,
                 3 => Mechanism::Shoot,
+                4 => Mechanism::BarDown,
                 _ => Mechanism::Intake,
             };
             let from = h[1].as_f64().unwrap_or(0.0) as f32;
             let to   = h[2].as_f64().unwrap_or(0.0) as f32;
-            let secs = h[3].as_f64().unwrap_or(1.0) as f32;
-            // i punti di sparo hanno from == to
-            if to > from || (kind == Mechanism::Shoot && to == from) {
-                app.highlights.push(Highlight { kind, from, to, secs });
+            let secs  = h[3].as_f64().unwrap_or(1.0) as f32;
+            let delay = h[4].as_f64().unwrap_or(0.0) as f32;
+            // le azioni puntuali su un nodo hanno from == to
+            if to > from || (kind.is_point_kind() && to == from) {
+                app.highlights.push(Highlight { kind, from, to, secs, delay });
             }
         }
     }

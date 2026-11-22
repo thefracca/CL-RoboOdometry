@@ -8,6 +8,17 @@ pub enum Mechanism {
     /// Sparo. Trascinato = spara mentre si muove nel tratto.
     /// Click su un nodo (tratto di lunghezza zero) = il robot, arrivato lì, si ferma e spara per `secs`.
     Shoot,
+    /// Abbassa barra (davanti all'intake). Di base è alzata. Solo a tratto: va evidenziata
+    /// anche attorno ai nodi in cui deve restare giù mentre il robot fa altro.
+    BarDown,
+}
+
+impl Mechanism {
+    /// Intake / Flywheel / Shoot possono essere messi anche su un solo NODO (azione puntuale
+    /// con ritardo e durata). La barra e l'intake giù no: solo a tratto.
+    pub fn is_point_kind(self) -> bool {
+        matches!(self, Mechanism::Intake | Mechanism::Flywheel | Mechanism::Shoot)
+    }
 }
 
 /// Tratto evidenziato del percorso in cui un meccanismo è attivo.
@@ -18,8 +29,10 @@ pub struct Highlight {
     pub kind: Mechanism,
     pub from: f32,
     pub to:   f32,
-    /// Durata dello sparo (s) — usata solo dai punti Shoot (from == to)
+    /// Solo per i punti su un nodo (from == to): durata dell'azione (s)
     pub secs: f32,
+    /// Solo per i punti su un nodo: ritardo (s) dall'arrivo sul nodo prima che l'azione parta
+    pub delay: f32,
 }
 
 /// Punto di parcheggio d'emergenza: se negli ultimi `trigger_s` secondi del match il
@@ -49,8 +62,6 @@ pub fn mechanism_active(highlights: &[Highlight], kind: Mechanism, p: f32) -> bo
 pub enum RobotAction {
     Move,
     Wait(f32),       // attendi N secondi fermo (senza sparare)
-    ShootStop(f32),  // spara fermo per N secondi
-    ShootMove(f32),  // spara per N s dall'inizio del segmento; se il segmento finisce prima, si ferma e finisce di sparare
 }
 
 impl Default for RobotAction {
@@ -90,9 +101,6 @@ pub struct SegmentOptions {
     pub robot_heading_start: f32,
     /// Heading del robot alla fine del segmento. Viene interpolato linearmente.
     pub robot_heading_end:   f32,
-    /// Velocità di rotazione (°/s) usata per ruotare dall'heading_end del segmento
-    /// precedente all'heading_start di questo segmento (fase Rotating tra segmenti).
-    pub rotation_speed: f32,
     /// Align (indipendente dall'azione): a fine segmento il robot si ferma e ruota
     /// sul posto fino a questo heading (gradi); poi esegue l'azione del segmento.
     pub align: Option<f32>,
@@ -105,7 +113,6 @@ impl Default for SegmentOptions {
             action:              RobotAction::default(),
             robot_heading_start: 90.0,
             robot_heading_end:   90.0,
-            rotation_speed:      180.0, // °/s default
             align:               None,
         }
     }
@@ -135,7 +142,7 @@ pub enum Segment {
     Line   { to: [f32; 2], opts: SegmentOptions },
     Curve  { controls: Vec<[f32; 2]>, to: [f32; 2], opts: SegmentOptions },
     /// Ricerca palline con camera: linea retta a velocità costante.
-    /// `opts` serve solo per gli heading del robot (start/end/rotation_speed).
+    /// `opts` serve solo per gli heading del robot (start/end).
     Search { to: [f32; 2], search: SearchParams, opts: SegmentOptions },
 }
 
@@ -180,7 +187,7 @@ impl Segment {
                 (0..=n).map(|i| {
                     let t = i as f32 / n as f32;
                     [from[0] + t * (to[0] - from[0]),
-                        from[1] + t * (to[1] - from[1])]
+                     from[1] + t * (to[1] - from[1])]
                 }).collect()
             }
             Segment::Curve { controls, to, .. } => {
@@ -195,7 +202,7 @@ impl Segment {
                     let t = i as f32 / n as f32;
                     let u = 1.0 - t;
                     [u*u*u*p0[0] + 3.0*u*u*t*p1[0] + 3.0*u*t*t*p2[0] + t*t*t*p3[0],
-                        u*u*u*p0[1] + 3.0*u*u*t*p1[1] + 3.0*u*t*t*p2[1] + t*t*t*p3[1]]
+                     u*u*u*p0[1] + 3.0*u*u*t*p1[1] + 3.0*u*t*t*p2[1] + t*t*t*p3[1]]
                 }).collect()
             }
         }

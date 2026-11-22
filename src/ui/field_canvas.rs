@@ -32,6 +32,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         if i.key_pressed(egui::Key::Num6) { app.mode = EditMode::AddSearch; }
         if i.key_pressed(egui::Key::Num7) { app.mode = EditMode::AddHighlight; }
         if i.key_pressed(egui::Key::Num8) { app.mode = EditMode::AddPark; }
+        if i.key_pressed(egui::Key::Num9) { app.mode = EditMode::AddForbidden; }
+        // Zone vietate: Invio chiude il poligono in disegno, Esc lo annulla
+        if i.key_pressed(egui::Key::Escape) { app.forbidden_draft.clear(); }
+        if i.key_pressed(egui::Key::Enter) && app.mode == EditMode::AddForbidden {
+            close_forbidden_draft(app);
+        }
         // Griglia
         if i.key_pressed(egui::Key::G) { app.hide_grid = !app.hide_grid; }
         // Robot → Start
@@ -47,6 +53,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 app.flywheel_active = false;
                 app.intake_low_active = false;
                 app.shoot_active = false;
+                app.bar_active = false;
             } else if !app.segments.is_empty() {
                 app.sim.start(&app.segments);
                 app.robot_pos     = app.start;
@@ -93,6 +100,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
 
         draw_field(&painter, &field, app);
         handle_input(&response, &field, app, ui.ctx());
+        draw_forbidden_zones(&painter, &field, app, response.hover_pos());
         draw_path(&painter, &field, app);
         draw_highlights(&painter, &field, app);
         draw_park(&painter, &field, app);
@@ -112,8 +120,9 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("4", "Barriera"),
     ("5", "Focale"),
     ("6", "Ricerca palline"),
-    ("7", "Evidenzia intake/flywheel/giù/sparo"),
+    ("7", "Evidenzia intake/flywheel/sparo/barra"),
     ("8", "Punto parcheggio"),
+    ("9", "Disegna zone vietate"),
     ("G", "Griglia + snap ON/OFF"),
     ("Space", "Play / Stop sim"),
     ("Home", "Robot → Start"),
@@ -127,6 +136,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Shift + drag", "Ruota robot"),
     ("Tasto dx", "Elimina punto"),
     ("Dbl click", "+ctrl point curva"),
+    ("Invio / Esc", "Chiudi / annulla zona vietata"),
 ];
 
 /// Pannello shortcut (colonna destra).
@@ -156,7 +166,17 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
         if let Some(pos) = response.interact_pointer_pos() {
             let fp = field.to_field(pos);
 
-            if app.mode == EditMode::AddHighlight {
+            if app.mode == EditMode::AddForbidden {
+                // Zone vietate: se parti da un vertice lo sposti, se parti da dentro la zona la sposti tutta
+                let origin = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+                if let Some((zi, vi)) = zone_vertex_at(origin, field) {
+                    app.dragging = Dragging::ForbiddenVertex(zi, vi);
+                } else if let Some(zi) = zone_at(origin, field) {
+                    app.dragging = Dragging::ForbiddenZone(zi);
+                } else {
+                    app.dragging = Dragging::Nothing;
+                }
+            } else if app.mode == EditMode::AddHighlight {
                 // Evidenziatore: il drag parte dal punto del percorso più vicino al click
                 let origin = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pos);
                 match path_pos_nearest(app, field, origin) {
@@ -242,6 +262,26 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                     }
                 }
                 Dragging::Park => { app.park.pos = clamped; }
+                Dragging::ForbiddenZone(zi) => {
+                    // sposta tutta la zona della variazione del puntatore, tenendola dentro al campo
+                    let mut zs = crate::forbidden::zones();
+                    if let Some(z) = zs.get_mut(zi) {
+                        let (lo, hi) = z.bbox();
+                        let dx = delta_cm[0].max(-lo[0]).min(FIELD_CM - hi[0]);
+                        let dy = delta_cm[1].max(-lo[1]).min(FIELD_CM - hi[1]);
+                        z.translate(dx, dy);
+                    }
+                    crate::forbidden::set_zones(zs);
+                }
+                Dragging::ForbiddenVertex(zi, vi) => {
+                    // sposta il vertice (snap alla griglia / ai bordi del campo)
+                    let p = snap_zone_point(fp, None, !app.hide_grid, false);
+                    let mut zs = crate::forbidden::zones();
+                    if let Some(v) = zs.get_mut(zi).and_then(|z| z.vertices.get_mut(vi)) {
+                        *v = p;
+                    }
+                    crate::forbidden::set_zones(zs);
+                }
                 Dragging::Highlighting => {
                     if let Some((p, _)) = path_pos_nearest(app, field, pos) {
                         if let Some((a, _)) = app.highlight_draft {
@@ -279,12 +319,15 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                     }
                 }
             }
+            Dragging::ForbiddenZone(_) | Dragging::ForbiddenVertex(_, _) => {
+                if let Err(e) = crate::forbidden::save() { eprintln!("zone_vietate.json: {e}"); }
+            }
             Dragging::Highlighting => {
                 if let Some((a, b)) = app.highlight_draft.take() {
                     let (f, t) = if a <= b { (a, b) } else { (b, a) };
                     if t - f > 0.01 {
                         let kind = app.highlight_kind;
-                        app.highlights.push(crate::segment::Highlight { kind, from: f, to: t, secs: 1.0 });
+                        app.highlights.push(crate::segment::Highlight { kind, from: f, to: t, secs: 1.0, delay: 0.0 });
                     }
                 }
             }
@@ -315,22 +358,35 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
 
             if app.mode == EditMode::AddHighlight {
                 // Sparo puntuale: solo sui NODI del percorso (arrivo di un segmento, start escluso)
-                if app.highlight_kind == crate::segment::Mechanism::Shoot {
+                if app.highlight_kind.is_point_kind() {
                     if let Some(ni) = waypoint_at(pos, field, app) {
                         if ni >= 1 {
                             let p = ni as f32;
+                            let kind = app.highlight_kind;
                             let exists = app.highlights.iter().any(|h| {
-                                h.kind == crate::segment::Mechanism::Shoot
-                                    && h.to - h.from < 1e-4
-                                    && (h.from - p).abs() < 1e-3
+                                h.kind == kind && h.to - h.from < 1e-4 && (h.from - p).abs() < 1e-3
                             });
                             if !exists {
                                 app.highlights.push(crate::segment::Highlight {
-                                    kind: crate::segment::Mechanism::Shoot,
-                                    from: p, to: p, secs: 1.0,
+                                    kind, from: p, to: p, secs: 1.0, delay: 0.0,
                                 });
                             }
                         }
+                    }
+                }
+            } else if app.mode == EditMode::AddForbidden {
+                // Zone vietate: ogni click aggiunge un vertice del poligono.
+                // Click sul primo vertice (o doppio click / Invio) = chiude la zona.
+                if !response.double_clicked() {
+                    let p = snap_zone_point(fp, app.forbidden_draft.last().copied(), !app.hide_grid, shift);
+                    let closes = app.forbidden_draft.len() >= 3
+                        && field.to_screen(app.forbidden_draft[0]).distance(pos) <= VERTEX_RADIUS + HIT_EXTRA;
+                    if closes {
+                        close_forbidden_draft(app);
+                    } else {
+                        let far_enough = app.forbidden_draft.last()
+                            .map_or(true, |l| (l[0] - p[0]).hypot(l[1] - p[1]) > 1.0);
+                        if far_enough { app.forbidden_draft.push(p); }
                     }
                 }
             } else if !on_existing {
@@ -412,7 +468,7 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                             app.focal_line_first = Some(clamped);
                         }
                     }
-                    EditMode::Select | EditMode::AddHighlight => {}
+                    EditMode::Select | EditMode::AddHighlight | EditMode::AddForbidden => {}
                 }
             }
         }
@@ -433,6 +489,7 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                     }
                     push_out_all_waypoints(app);
                 }
+                EditMode::AddForbidden => close_forbidden_draft(app),
                 EditMode::AddFocalLine => {} // doppio click ignorato
                 // In Select o AddCurve: aggiunge control point alla curva più vicina
                 EditMode::Select | EditMode::AddCurve => {
@@ -479,6 +536,18 @@ fn handle_input(response: &Response, field: &FieldView, app: &mut HudApp, ctx: &
                                 app.barriers.pop();
                             }
                         }
+                    }
+                }
+                EditMode::AddForbidden => {
+                    if !app.forbidden_draft.is_empty() {
+                        // zona in disegno: annulla l'ultimo vertice
+                        app.forbidden_draft.pop();
+                    } else if let Some(zi) = zone_at(pos, field) {
+                        // tasto destro su una zona vietata: la elimina e salva
+                        let mut zs = crate::forbidden::zones();
+                        zs.remove(zi);
+                        crate::forbidden::set_zones(zs);
+                        if let Err(e) = crate::forbidden::save() { eprintln!("zone_vietate.json: {e}"); }
                     }
                 }
                 EditMode::AddFocalLine => {
@@ -732,7 +801,10 @@ fn draw_path(painter: &Painter, field: &FieldView, app: &HudApp) {
             }
         }
 
-        let path_color = if is_search { Color32::from_rgb(190, 110, 255) }
+        // rosso se il segmento attraversa una zona vietata
+        let path_color = if crate::forbidden::path_hits(
+                &pts, seg.opts().robot_heading_start, seg.opts().robot_heading_end) { Color32::from_rgb(255, 60, 60) }
+                         else if is_search { Color32::from_rgb(190, 110, 255) }
                          else { Color32::from_rgb(100, 180, 255) };
         for w in pts.windows(2) {
             painter.line_segment(
@@ -764,6 +836,160 @@ fn draw_path(painter: &Painter, field: &FieldView, app: &HudApp) {
     }
 }
 
+/// Limita un punto (cm) al campo (senza margini: il centro di una zona può stare anche sul bordo).
+fn clamp_raw(p: [f32; 2]) -> [f32; 2] {
+    [p[0].clamp(0.0, FIELD_CM), p[1].clamp(0.0, FIELD_CM)]
+}
+
+/// Punto per i vertici delle zone vietate: dentro al campo (senza i margini del robot e senza
+/// essere spinto fuori dalle zone stesse), con snap alla griglia / ai bordi del campo (se la
+/// griglia è ON) e, tenendo Shift, allineato in orizzontale o verticale all'ultimo vertice.
+fn snap_zone_point(fp: [f32; 2], reference: Option<[f32; 2]>, grid_on: bool, shift: bool) -> [f32; 2] {
+    let mut p = clamp_raw(fp);
+    if grid_on {
+        let m = EXCLUSION_CM;
+        for k in 0..2 {
+            if p[k] < SNAP_THRESHOLD_CM {
+                p[k] = 0.0;
+            } else if p[k] > FIELD_CM - SNAP_THRESHOLD_CM {
+                p[k] = FIELD_CM;
+            } else {
+                let g = m + ((p[k] - m) / GRID_SNAP_STEP).round() * GRID_SNAP_STEP;
+                if (p[k] - g).abs() < SNAP_THRESHOLD_CM { p[k] = g; }
+            }
+        }
+    }
+    if shift {
+        if let Some(r) = reference {
+            if (p[0] - r[0]).abs() < (p[1] - r[1]).abs() { p[0] = r[0]; } else { p[1] = r[1]; }
+        }
+    }
+    clamp_raw(p)
+}
+
+/// Chiude la zona in disegno (servono almeno 3 vertici e un'area non nulla), la aggiunge
+/// alle zone vietate e salva `zone_vietate.json`.
+pub fn close_forbidden_draft(app: &mut HudApp) {
+    if app.forbidden_draft.len() < 3 { return; }
+    let zone = crate::forbidden::ForbiddenZone { vertices: std::mem::take(&mut app.forbidden_draft) };
+    if zone.area() < 1.0 { return; }
+    let mut zs = crate::forbidden::zones();
+    zs.push(zone);
+    crate::forbidden::set_zones(zs);
+    if let Err(e) = crate::forbidden::save() { eprintln!("zone_vietate.json: {e}"); }
+}
+
+/// Zona vietata sotto il cursore (dentro al poligono o a pochi pixel dal suo bordo).
+fn zone_at(pos: Pos2, field: &FieldView) -> Option<usize> {
+    let fp = field.to_field(pos);
+    let tol = 8.0 * FIELD_CM / field.rect.width(); // 8 px in cm
+    crate::forbidden::zones().iter().position(|z| z.dist_to(fp) <= tol)
+}
+
+/// Vertice di una zona vietata sotto il cursore: (indice zona, indice vertice).
+fn zone_vertex_at(pos: Pos2, field: &FieldView) -> Option<(usize, usize)> {
+    for (zi, z) in crate::forbidden::zones().iter().enumerate() {
+        for (vi, v) in z.vertices.iter().enumerate() {
+            if field.to_screen(*v).distance(pos) <= VERTEX_RADIUS + HIT_EXTRA {
+                return Some((zi, vi));
+            }
+        }
+    }
+    None
+}
+
+/// Zone del campo sempre vietate: poligoni rossi (+ contorno tratteggiato = limite per il CENTRO
+/// del robot) e la bozza della zona che stai disegnando.
+fn draw_forbidden_zones(painter: &Painter, field: &FieldView, app: &HudApp, hover: Option<Pos2>) {
+    let fill   = Color32::from_rgba_unmultiplied(255, 40, 40, 55);
+    let edge   = Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 70, 70, 200));
+    let ring_s = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 200, 80, 110));
+    let editing = app.mode == EditMode::AddForbidden;
+
+    for (i, z) in crate::forbidden::zones().iter().enumerate() {
+        if z.vertices.len() < 3 { continue; }
+        let pts: Vec<Pos2> = z.vertices.iter().map(|v| field.to_screen(*v)).collect();
+
+        // riempimento (triangolato: funziona anche con poligoni concavi)
+        let mut mesh = egui::Mesh::default();
+        for p in &pts { mesh.colored_vertex(*p, fill); }
+        for t in crate::forbidden::triangulate(&z.vertices) {
+            mesh.add_triangle(t[0] as u32, t[1] as u32, t[2] as u32);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+
+        // bordo
+        for k in 0..pts.len() {
+            painter.line_segment([pts[k], pts[(k + 1) % pts.len()]], edge);
+        }
+
+        // limite per il CENTRO del robot (il poligono "gonfiato" di mezzo robot + 2 cm)
+        let ring: Vec<Pos2> = crate::forbidden::keep_out_outline(z)
+            .iter().map(|v| field.to_screen(*v)).collect();
+        for k in 0..ring.len() {
+            painter.line_segment([ring[k], ring[(k + 1) % ring.len()]], ring_s);
+        }
+
+        // maniglie dei vertici (solo mentre stai modificando le zone)
+        if editing {
+            for p in &pts {
+                painter.circle_filled(*p, 4.5, Color32::from_rgb(255, 90, 90));
+                painter.circle_stroke(*p, 4.5, Stroke::new(1.0, Color32::WHITE));
+            }
+        }
+
+        painter.text(
+            field.to_screen(z.centroid()),
+            Align2::CENTER_CENTER,
+            format!("✖ ZONA {}", i + 1),
+            FontId::proportional(12.0),
+            Color32::from_rgb(255, 150, 150),
+        );
+    }
+
+    // Bozza: la zona che stai disegnando
+    let d = &app.forbidden_draft;
+    if d.is_empty() { return; }
+    let pts: Vec<Pos2> = d.iter().map(|v| field.to_screen(*v)).collect();
+    let draft_s = Stroke::new(2.0, Color32::from_rgb(255, 120, 120));
+    let faint_s = Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 120, 120, 130));
+    for w in pts.windows(2) {
+        painter.line_segment([w[0], w[1]], draft_s);
+    }
+    let last = *pts.last().unwrap();
+    match hover {
+        Some(h) if editing => {
+            // anteprima: ultimo vertice → cursore, e cursore → primo vertice (dove chiuderà)
+            let shift = painter.ctx().input(|i| i.modifiers.shift);
+            let p = snap_zone_point(field.to_field(h), d.last().copied(), !app.hide_grid, shift);
+            let hp = field.to_screen(p);
+            draw_dashed_line(painter, last, hp, 6.0, 5.0, faint_s);
+            if pts.len() >= 2 {
+                draw_dashed_line(painter, hp, pts[0], 6.0, 5.0, faint_s);
+            }
+            painter.circle_stroke(hp, 4.5, Stroke::new(1.5, Color32::from_rgb(255, 160, 160)));
+        }
+        _ => {
+            if pts.len() >= 3 {
+                draw_dashed_line(painter, last, pts[0], 6.0, 5.0, faint_s);
+            }
+        }
+    }
+    for (k, p) in pts.iter().enumerate() {
+        // il primo vertice (cliccabile per chiudere) è più grande
+        let r = if k == 0 && pts.len() >= 3 { 7.0 } else { 4.5 };
+        painter.circle_filled(*p, r, Color32::from_rgb(255, 120, 120));
+        painter.circle_stroke(*p, r, Stroke::new(1.5, Color32::WHITE));
+    }
+    painter.text(
+        pts[0] + Vec2::new(0.0, -16.0),
+        Align2::CENTER_CENTER,
+        format!("{} vertici", d.len()),
+        FontId::proportional(11.0),
+        Color32::from_rgb(255, 170, 170),
+    );
+}
+
 fn park_at(pos: Pos2, field: &FieldView, app: &HudApp) -> bool {
     app.park.enabled
         && field.to_screen(app.park.pos).distance(pos) <= WAYPOINT_RADIUS + HIT_EXTRA
@@ -783,6 +1009,14 @@ fn draw_park(painter: &Painter, field: &FieldView, app: &HudApp) {
         Color32::from_rgb(40, 160, 200),
         Stroke::new(1.5, Color32::WHITE),
     ));
+    // Tragitto di emergenza dall'ultimo punto del percorso (aggira le zone vietate)
+    let route = crate::forbidden::route_avoiding(last_point(app), app.park.pos);
+    for w in route.windows(2) {
+        draw_dashed_line(
+            painter, field.to_screen(w[0]), field.to_screen(w[1]), 6.0, 5.0,
+            Stroke::new(1.5, Color32::from_rgba_unmultiplied(120, 220, 255, 150)),
+        );
+    }
     painter.text(sp, Align2::CENTER_CENTER, "P", FontId::proportional(14.0), Color32::WHITE);
     let a = app.park.heading * PI / 180.0;
     painter.arrow(sp, Vec2::new(a.cos(), -a.sin()) * 26.0,
@@ -857,6 +1091,7 @@ fn draw_highlights(painter: &Painter, field: &FieldView, app: &HudApp) {
     use crate::segment::Mechanism;
     let style = |k: Mechanism, alpha: u8| -> Stroke {
         match k {
+            Mechanism::BarDown    => Stroke::new(22.0, Color32::from_rgba_unmultiplied(220, 90, 220, alpha.saturating_sub(90))),
             Mechanism::Shoot      => Stroke::new(3.0, Color32::from_rgba_unmultiplied(255, 70, 70, alpha)),
             Mechanism::IntakeDown => Stroke::new(16.0, Color32::from_rgba_unmultiplied(80, 160, 255, alpha.saturating_sub(50))),
             Mechanism::Intake   => Stroke::new(10.0, Color32::from_rgba_unmultiplied(0, 200, 100, alpha)),
@@ -870,24 +1105,29 @@ fn draw_highlights(painter: &Painter, field: &FieldView, app: &HudApp) {
             painter.add(egui::Shape::line(pts, stroke));
         }
     };
-    for kind in [Mechanism::IntakeDown, Mechanism::Intake, Mechanism::Flywheel, Mechanism::Shoot] {
+    for kind in [Mechanism::BarDown, Mechanism::IntakeDown, Mechanism::Intake, Mechanism::Flywheel, Mechanism::Shoot] {
         for h in app.highlights.iter().filter(|h| h.kind == kind && h.to - h.from > 1e-4) {
             draw(h.from, h.to, style(kind, 150));
         }
     }
-    // Sparo puntuale: il robot si ferma qui e spara per N secondi
-    for h in app.highlights.iter().filter(|h| h.kind == Mechanism::Shoot && h.to - h.from < 1e-4) {
+    // Azioni puntuali su un nodo: il robot si ferma lì (sparo / intake / flywheel con ritardo e durata)
+    for h in app.highlights.iter().filter(|h| h.kind.is_point_kind() && h.to - h.from < 1e-4) {
         if let Some(p) = path_point_at(app, h.from) {
-            let sp = field.to_screen(p);
-            painter.circle_filled(sp, 8.0, Color32::from_rgba_unmultiplied(255, 70, 70, 190));
+            let (col, dx, tag) = match h.kind {
+                Mechanism::Intake   => (Color32::from_rgb(0, 200, 100), -16.0, "I"),
+                Mechanism::Flywheel => (Color32::from_rgb(255, 160, 0),   0.0, "F"),
+                _                   => (Color32::from_rgb(255, 70, 70),  16.0, "S"),
+            };
+            let sp = field.to_screen(p) + Vec2::new(dx, 14.0);
+            painter.circle_filled(sp, 8.0, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 200));
             painter.circle_stroke(sp, 8.0, Stroke::new(1.5, Color32::WHITE));
-            painter.text(
-                sp + Vec2::new(0.0, -16.0),
-                Align2::CENTER_CENTER,
-                format!("🎯 {:.1}s", h.secs),
-                FontId::proportional(11.0),
-                Color32::from_rgb(255, 150, 150),
-            );
+            painter.text(sp, Align2::CENTER_CENTER, tag, FontId::proportional(10.0), Color32::WHITE);
+            let label = if h.delay > 0.0 {
+                format!("+{:.1}·{:.1}s", h.delay, h.secs)
+            } else {
+                format!("{:.1}s", h.secs)
+            };
+            painter.text(sp + Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, label, FontId::proportional(10.0), col);
         }
     }
     if let Some((a, b)) = app.highlight_draft {
@@ -949,7 +1189,11 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 240, 120, 120)),
         ));
     }
-    let (body_fill, body_stroke) = if searching {
+    // Rosso se il corpo del robot tocca (o sta a ≤ 2 cm da) una zona vietata
+    let zone_hit = crate::forbidden::robot_hits(app.robot_pos, app.robot_heading);
+    let (body_fill, body_stroke) = if zone_hit {
+        (Color32::from_rgba_unmultiplied(255, 50, 50, 190), Color32::from_rgb(255, 90, 90))
+    } else if searching {
         (Color32::from_rgba_unmultiplied(180, 80, 255, 150), Color32::from_rgb(215, 140, 255))
     } else {
         (Color32::from_rgba_unmultiplied(0, 220, 220, 120), Color32::from_rgb(0, 255, 255))
@@ -974,6 +1218,24 @@ fn draw_robot(painter: &Painter, field: &FieldView, app: &HudApp) {
         painter.line_segment(
             [rotate(-half, -half - 5.0), rotate(half, -half - 5.0)],
             Stroke::new(5.0, Color32::from_rgb(80, 160, 255)),
+        );
+    }
+
+    if zone_hit {
+        painter.text(
+            center + Vec2::new(0.0, half + 14.0),
+            Align2::CENTER_CENTER,
+            "⚠ ZONA VIETATA",
+            FontId::proportional(11.0),
+            Color32::from_rgb(255, 120, 120),
+        );
+    }
+
+    // Barra abbassata (davanti all'intake): sbarra grossa magenta più avanti
+    if app.bar_active {
+        painter.line_segment(
+            [rotate(-half, -half - 14.0), rotate(half, -half - 14.0)],
+            Stroke::new(7.0, Color32::from_rgb(220, 90, 220)),
         );
     }
 
@@ -1185,7 +1447,7 @@ fn draw_preview(painter: &Painter, field: &FieldView, app: &HudApp, hover: Optio
             painter.circle_filled(field.to_screen(fp), 8.0,
                 Color32::from_rgba_unmultiplied(40, 160, 200, 160));
         }
-        EditMode::Select | EditMode::AddHighlight => {}
+        EditMode::Select | EditMode::AddHighlight | EditMode::AddForbidden => {}
     }
 }
 
@@ -1465,7 +1727,9 @@ const SNAP_THRESHOLD_CM: f32 = 8.0;           // entro 8cm si attrae
 
 fn clamp_field(fp: [f32; 2]) -> [f32; 2] {
     let m = EXCLUSION_CM;
-    [fp[0].clamp(m, FIELD_CM - m), fp[1].clamp(m, FIELD_CM - m)]
+    let p = [fp[0].clamp(m, FIELD_CM - m), fp[1].clamp(m, FIELD_CM - m)];
+    // le zone vietate permanenti non si possono mai occupare: il punto viene spinto fuori
+    crate::forbidden::push_out(p)
 }
 
 /// Snap automatico: griglia (se griglia ON), ortho rispetto a reference, linee focali.

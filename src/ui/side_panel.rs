@@ -27,12 +27,15 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
             mode_btn(ui, app, EditMode::AddHighlight,"🖍 Evidenzia");
             mode_btn(ui, app, EditMode::AddPark,     "🅿 Parcheggio");
             ui.end_row();
+            mode_btn(ui, app, EditMode::AddForbidden,"⛔ Zone vietate");
+            ui.end_row();
         });
         ui.label(RichText::new(match app.mode {
             EditMode::Select      => "Trascina punti/robot\nShift+drag robot = ruota",
             EditMode::AddLine     => "Click = nodo linea",
             EditMode::AddCurve    => "Click = nodo curva\nDoppio click = +ctrl pt",
             EditMode::AddBarrier  => "Click = vertice\nDoppio click = chiudi\nTasto dx = annulla",
+            EditMode::AddForbidden=> "Click = vertice del poligono\nDoppio click / 1° vertice / Invio = chiudi\nTrascina vertice o zona = sposta\nTasto dx = annulla vertice / elimina zona",
             EditMode::AddPark     => "Click = punto di parcheggio\nd'emergenza (ultimi secondi)",
             EditMode::AddHighlight=> "Trascina sul percorso per\nevidenziare un tratto\n(tipo scelto sotto)",
             EditMode::AddSearch   => "Click = punto di arrivo\nArea: dall'ultimo punto a qui",
@@ -65,6 +68,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 (Mechanism::Flywheel,   "FLYWHEEL",   Color32::from_rgb(255, 160, 0)),
                 (Mechanism::IntakeDown, "INTAKE GIÙ", Color32::from_rgb(80, 160, 255)),
                 (Mechanism::Shoot,      "SPARO",      Color32::from_rgb(255, 70, 70)),
+                (Mechanism::BarDown,    "BARRA GIÙ",  Color32::from_rgb(220, 90, 220)),
             ] {
                 let sel = app.highlight_kind == k;
                 let btn = Button::new(RichText::new(label).color(Color32::WHITE).small())
@@ -75,33 +79,79 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 }
             }
         });
-        if app.highlight_kind == Mechanism::Shoot {
-            ui.label(RichText::new("SPARO: trascina = spara mentre si muove;\nclick su un NODO = si ferma lì e spara").small().weak());
-        }
+        let hint = match app.highlight_kind {
+            Mechanism::Intake | Mechanism::Flywheel | Mechanism::Shoot =>
+                "Trascina = attivo mentre si muove;\nclick su un NODO = si ferma lì: scegli\n'dopo' (ritardo) e 'dura' (durata)",
+            Mechanism::IntakeDown | Mechanism::BarDown =>
+                "Solo a tratto (trascina): evidenzia\nanche attorno ai nodi in cui deve\nrestare giù mentre fai altro",
+        };
+        ui.label(RichText::new(hint).small().weak());
         if app.highlights.is_empty() {
             ui.label(RichText::new("(nessun tratto evidenziato)").small().weak());
         }
         let mut remove_hl: Option<usize> = None;
         for (i, h) in app.highlights.iter_mut().enumerate() {
+            let (name, col) = match h.kind {
+                Mechanism::Intake     => ("INTAKE",     Color32::from_rgb(0, 200, 100)),
+                Mechanism::Flywheel   => ("FLYWHEEL",   Color32::from_rgb(255, 160, 0)),
+                Mechanism::IntakeDown => ("INTAKE GIÙ", Color32::from_rgb(80, 160, 255)),
+                Mechanism::Shoot      => ("SPARO",      Color32::from_rgb(255, 70, 70)),
+                Mechanism::BarDown    => ("BARRA GIÙ",  Color32::from_rgb(220, 90, 220)),
+            };
+            let is_point = h.to - h.from < 1e-4;
             ui.horizontal(|ui| {
-                let (name, col) = match h.kind {
-                    Mechanism::Intake   => ("INTAKE",   Color32::from_rgb(0, 200, 100)),
-                    Mechanism::Flywheel => ("FLYWHEEL", Color32::from_rgb(255, 160, 0)),
-                    Mechanism::IntakeDown => ("INTAKE GIÙ", Color32::from_rgb(80, 160, 255)),
-                    Mechanism::Shoot      => ("SPARO",      Color32::from_rgb(255, 70, 70)),
-                };
-                if h.to - h.from < 1e-4 {
-                    // punto di sparo: si ferma e spara per N secondi
-                    ui.label(RichText::new(format!("{name} ● {}", fmt_pos(h.from))).small().color(col));
-                    ui.add(egui::Slider::new(&mut h.secs, 0.1..=10.0).text("s").step_by(0.1));
+                if is_point {
+                    ui.label(RichText::new(format!("{name} ● nodo {}", h.from.round() as usize))
+                        .small().color(col));
                 } else {
                     ui.label(RichText::new(format!("{name} {} → {}", fmt_pos(h.from), fmt_pos(h.to)))
                         .small().color(col));
                 }
                 if ui.small_button("✖").clicked() { remove_hl = Some(i); }
             });
+            if is_point {
+                // azione puntuale: parte `ritardo` s dopo l'arrivo sul nodo e dura `durata` s
+                ui.add(egui::Slider::new(&mut h.delay, 0.0..=10.0).text("dopo s").step_by(0.1));
+                ui.add(egui::Slider::new(&mut h.secs, 0.1..=10.0).text("dura s").step_by(0.1));
+            }
         }
         if let Some(i) = remove_hl { app.highlights.remove(i); }
+
+        // ── Zone vietate (permanenti, salvate da sole in zone_vietate.json) ──
+        ui.separator();
+        ui.label(RichText::new("Zone vietate").small().strong());
+        {
+            let mut zs = crate::forbidden::zones();
+            let mut del: Option<usize> = None;
+            if zs.is_empty() && app.forbidden_draft.is_empty() {
+                ui.label(RichText::new("(nessuna: usa ⛔ e clicca i vertici sul campo)").small().weak());
+            }
+            for (i, z) in zs.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Z{} · {} vertici", i + 1, z.vertices.len())).small());
+                    if ui.small_button("✖").clicked() { del = Some(i); }
+                });
+            }
+            if let Some(i) = del {
+                zs.remove(i);
+                crate::forbidden::set_zones(zs);
+                if let Err(e) = crate::forbidden::save() { eprintln!("zone_vietate.json: {e}"); }
+            }
+        }
+        // zona in disegno: chiudila o annullala da qui
+        if !app.forbidden_draft.is_empty() {
+            ui.label(RichText::new(format!("Zona in disegno: {} vertici", app.forbidden_draft.len()))
+                .small().color(Color32::from_rgb(255, 150, 150)));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(app.forbidden_draft.len() >= 3, egui::Button::new("✔ Chiudi").small()).clicked() {
+                    crate::ui::field_canvas::close_forbidden_draft(app);
+                }
+                if ui.small_button("✖ Annulla").clicked() {
+                    app.forbidden_draft.clear();
+                }
+            });
+        }
+        ui.label(RichText::new("Il robot (con la sua larghezza) non deve toccarle.\nSi salvano da sole (zone_vietate.json).").small().weak());
 
         // ── Parcheggio d'emergenza ───────────────────────────
         ui.separator();
@@ -154,6 +204,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
         indicator(ui, "🔍 SEARCH", app.sim.state == SimState::Searching, Color32::from_rgb(170, 90, 255));
         indicator(ui, "⬇ INTAKE GIÙ", app.intake_low_active, Color32::from_rgb(80, 160, 255));
         indicator(ui, "🎯 SHOOT", app.shoot_active, Color32::from_rgb(255, 70, 70));
+        indicator(ui, "▬ BARRA GIÙ", app.bar_active, Color32::from_rgb(220, 90, 220));
         ui.add_space(4.0);
 
         let remaining = (MATCH_DURATION - app.sim.elapsed).max(0.0);
@@ -176,8 +227,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     ui.label(RichText::new("✅ Percorso completato").color(Color32::GREEN).small());
                 }
             }
-            SimState::Running | SimState::Rotating { .. } | SimState::Waiting { .. } | SimState::ShootStop { .. } | SimState::ShootMove | SimState::Searching
-            | SimState::Aligning { .. } | SimState::Parking | SimState::ShootHold { .. } => {
+            SimState::Running | SimState::Rotating { .. } | SimState::Waiting { .. } | SimState::ShootStop { .. } | SimState::Searching
+            | SimState::Aligning { .. } | SimState::Parking | SimState::NodeHold { .. } => {
                 if ui.add_sized(BTN, Button::new(
                     RichText::new("⏹ Stop").color(Color32::WHITE)
                 ).fill(Color32::from_rgb(180, 50, 50))).clicked() {
@@ -186,6 +237,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     app.flywheel_active = false;
                     app.intake_low_active = false;
                     app.shoot_active = false;
+                    app.bar_active = false;
                 }
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("⏱ {:.1}s", remaining))
@@ -197,11 +249,14 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                     SimState::Waiting { remaining } =>
                         ui.label(RichText::new(format!("⏸ WAIT {:.1}s", remaining))
                             .color(Color32::from_rgb(150, 150, 255)).size(14.0)),
+                    SimState::ShootStop { remaining } =>
+                        ui.label(RichText::new(format!("🎯 SHOOT+STOP {:.1}s", remaining))
+                            .color(Color32::YELLOW).size(14.0)),
                     SimState::Aligning { current, to, .. } =>
                         ui.label(RichText::new(format!("↺ ALIGN {:.0}° → {:.0}°", current, to))
                             .color(Color32::from_rgb(180, 180, 255)).size(14.0)),
-                    SimState::ShootHold { remaining, .. } =>
-                        ui.label(RichText::new(format!("🎯 SPARO (punto) {:.1}s", remaining))
+                    SimState::NodeHold { remaining, .. } =>
+                        ui.label(RichText::new(format!("📍 AZIONI NODO {:.1}s", remaining))
                             .color(Color32::from_rgb(255, 90, 90)).size(14.0)),
                     SimState::Parking =>
                         ui.label(RichText::new("🅿 PARCHEGGIO D'EMERGENZA")
@@ -309,15 +364,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                         d
                     }
                 )).small().weak());
-                ui.add(egui::Slider::new(&mut opts.rotation_speed, 10.0..=720.0)
-                    .text("vel. rot. °/s").step_by(5.0));
-                ui.label(RichText::new("(velocità rotazione all'inizio di questo segmento)").small().weak());
 
                 ui.separator();
 
                 // Azione
                 ui.label(RichText::new("Azione").small().strong());
-                let is_wait      = matches!(opts.action, RobotAction::Wait(_));
+                let is_wait = matches!(opts.action, RobotAction::Wait(_));
                 ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(
                         matches!(opts.action, RobotAction::Move), "Move"
@@ -329,7 +381,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
                 if let RobotAction::Wait(secs) = &mut opts.action {
                     ui.add(egui::Slider::new(secs, 0.1..=10.0).text("s").step_by(0.1));
                 }
-
+                ui.label(RichText::new("Sparo / intake / flywheel: usa l'evidenziatore\n(click su un nodo = azione puntuale)").small().weak());
                 ui.separator();
                 align_ui(ui, opts);
 
@@ -360,9 +412,30 @@ pub fn show(ui: &mut egui::Ui, app: &mut HudApp) {
 
         ui.separator();
 
+        // ── Zone vietate ──
+        if app.sim.zone_hit {
+            ui.label(RichText::new("⚠ Nella simulazione il robot ha toccato una zona vietata")
+                .color(Color32::from_rgb(255, 90, 90)).small());
+        }
+        {
+            let mut prev = app.start;
+            let mut bad: Vec<String> = Vec::new();
+            for (i, seg) in app.segments.iter().enumerate() {
+                if crate::forbidden::path_hits(
+                    &seg.sample(prev, 60), seg.opts().robot_heading_start, seg.opts().robot_heading_end) {
+                    bad.push(format!("#{i}"));
+                }
+                prev = seg.end();
+            }
+            if !bad.is_empty() {
+                ui.label(RichText::new(format!("⚠ Zona vietata: il robot (con la sua larghezza) la tocca nei segmenti {}", bad.join(", ")))
+                    .color(Color32::from_rgb(255, 90, 90)).small());
+            }
+        }
+
         // ── Tempo stimato ─────────────────────────────────────
         if !app.segments.is_empty() {
-            let estimated = crate::simulation::estimate_total_time(app.start, &app.segments);
+            let estimated = crate::simulation::estimate_total_time(app.start, &app.segments, &app.node_actions());
             let color = if estimated > 30.0 { Color32::RED }
                         else if estimated > 25.0 { Color32::YELLOW }
                         else { Color32::GREEN };
@@ -465,7 +538,6 @@ fn search_ui(
     ui.label(RichText::new("Heading robot (mecanum)").small().strong());
     ui.add(egui::Slider::new(&mut opts.robot_heading_start, 0.0..=359.0).text("inizio °").step_by(1.0));
     ui.add(egui::Slider::new(&mut opts.robot_heading_end, 0.0..=359.0).text("fine °").step_by(1.0));
-    ui.add(egui::Slider::new(&mut opts.rotation_speed, 10.0..=720.0).text("vel. rot. °/s").step_by(5.0));
 
     ui.separator();
     align_ui(ui, opts);
@@ -480,7 +552,7 @@ fn align_ui(ui: &mut egui::Ui, opts: &mut crate::segment::SegmentOptions) {
     }
     if let Some(deg) = &mut opts.align {
         ui.add(egui::Slider::new(deg, 0.0..=359.0).text("verso °").step_by(1.0));
-        ui.label(RichText::new("Si ferma e gira sul posto (vel. rot. del segmento),\npoi esegue l'azione (wait / sparo)").small().weak());
+        ui.label(RichText::new("Si ferma e gira sul posto, poi esegue le azioni\npuntuali del nodo e l'azione (wait)").small().weak());
     }
 }
 
@@ -491,7 +563,7 @@ fn fmt_pos(p: f32) -> String {
 
 /// Piccolo grafico velocità/tempo dell'intero percorso (stima), con cursore durante la simulazione.
 fn speed_graph(ui: &mut egui::Ui, app: &HudApp) {
-    let trace = crate::simulation::speed_trace(app.start, &app.segments);
+    let trace = crate::simulation::speed_trace(app.start, &app.segments, &app.node_actions());
     let total = trace.last().map(|p| p[0]).unwrap_or(0.0);
     let t_max = total.max(MATCH_DURATION);
     let v_top = trace.iter().map(|p| p[1]).fold(10.0_f32, f32::max) * 1.1;

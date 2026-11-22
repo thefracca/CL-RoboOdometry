@@ -5,6 +5,7 @@ mod assets;
 mod barrier;
 mod export;
 mod field;
+mod forbidden;
 mod project;
 mod segment;
 mod simulation;
@@ -14,6 +15,9 @@ use app::HudApp;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // zone vietate disegnate in precedenza (zone_vietate.json)
+    forbidden::load();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 860.0])

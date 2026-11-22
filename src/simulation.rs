@@ -1,7 +1,10 @@
-use crate::segment::{ParkPoint, RobotAction, Segment, SpeedProfile};
+use crate::segment::{Mechanism, ParkPoint, RobotAction, Segment, SpeedProfile};
 
 pub const MATCH_DURATION: f32 = 30.0;
 const SAMPLES: usize = 120;
+/// Velocità di rotazione sul posto (°/s) usata per stime e simulazione. Non è regolabile:
+/// col follower reale la rotazione la gestisce lui.
+pub const ROTATION_SPEED_DEG_S: f32 = 180.0;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub enum SimState {
@@ -14,17 +17,30 @@ pub enum SimState {
     Waiting { remaining: f32 },
     /// Robot fermo, sta sparando per `remaining` secondi
     ShootStop { remaining: f32 },
-    /// Robot in movimento su un segmento con azione Shoot+Move (spara per tutto il segmento)
-    ShootMove,
     /// Robot in ricerca palline (camera): linea retta a velocità costante
     Searching,
     /// Robot fermo, a fine segmento gira su se stesso fino all'heading `to`
     Aligning { to: f32, current: f32, speed: f32 },
     /// Failsafe: ultimi secondi, lascia tutto e va dritto al punto di parcheggio
     Parking,
-    /// Punto di sparo su un nodo: il robot è fermo a fine segmento e spara, poi esegue l'azione.
-    ShootHold { remaining: f32 },
+    /// Azioni puntuali su un nodo (sparo / intake / flywheel con ritardo e durata):
+    /// il robot è fermo a fine segmento, poi esegue l'azione del segmento.
+    NodeHold { remaining: f32 },
     Finished,
+}
+
+/// Azione puntuale su un nodo: `kind` attivo da `delay` a `delay + secs` secondi dopo l'arrivo.
+#[derive(Clone, Debug)]
+pub struct NodeAction {
+    pub node:  usize, // nodo = arrivo del segmento node-1
+    pub kind:  Mechanism,
+    pub delay: f32,
+    pub secs:  f32,
+}
+
+/// Tempo di sosta su un nodo = fine dell'ultima azione puntuale (ritardo + durata).
+fn node_hold_time(actions: &[NodeAction], node: usize) -> f32 {
+    actions.iter().filter(|a| a.node == node).map(|a| a.delay + a.secs).fold(0.0, f32::max)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -44,10 +60,15 @@ pub struct Simulation {
     pub seg_time:  f32,
     /// Parcheggio d'emergenza (aggiornato dall'app ad ogni frame)
     pub park:      Option<ParkPoint>,
-    pub park_from: [f32; 2],
+    /// Tragitto di emergenza verso il parcheggio (aggira le zone vietate)
+    pub park_route: Vec<[f32; 2]>,
     pub park_from_heading: f32,
-    /// Punti di sparo sui nodi: (numero del nodo = arrivo del segmento n-1, secondi)
-    pub shoot_points: Vec<(f32, f32)>,
+    /// Azioni puntuali sui nodi (aggiornate dall'app ad ogni frame)
+    pub node_actions: Vec<NodeAction>,
+    /// Tempo trascorso nella sosta su un nodo (s)
+    pub hold_time: f32,
+    /// Nella simulazione in corso il corpo del robot ha toccato una zona vietata (aggiornato dall'app)
+    pub zone_hit: bool,
 }
 
 // ════════════════════════════════════════════════════════════
@@ -87,13 +108,13 @@ fn interp_heading(start: f32, end: f32, t: f32) -> f32 {
 
 /// Profilo di velocità nel tempo dell'intero percorso: punti [tempo s, velocità cm/s].
 /// Stessa cinematica della simulazione (passo fine).
-pub fn speed_trace(start: [f32; 2], segments: &[Segment]) -> Vec<[f32; 2]> {
+pub fn speed_trace(start: [f32; 2], segments: &[Segment], node_actions: &[NodeAction]) -> Vec<[f32; 2]> {
     let mut out: Vec<[f32; 2]> = vec![[0.0, 0.0]];
     let mut total = 0.0_f32;
     let mut prev = start;
     let mut prev_heading_end: Option<f32> = None;
 
-    for seg in segments {
+    for (seg_i, seg) in segments.iter().enumerate() {
         let opts = seg.opts();
 
         // Rotazione sul posto tra la fine del segmento precedente e l'inizio di questo
@@ -101,21 +122,19 @@ pub fn speed_trace(start: [f32; 2], segments: &[Segment]) -> Vec<[f32; 2]> {
             let d = heading_delta(pe, opts.robot_heading_start).abs();
             if d > 1.0 {
                 out.push([total, 0.0]);
-                total += d / opts.rotation_speed.max(1.0);
+                total += d / ROTATION_SPEED_DEG_S;
                 out.push([total, 0.0]);
             }
         }
 
         let pts = seg.sample(prev, SAMPLES);
         let len = *cumulative(&pts).last().unwrap_or(&0.0);
-        let mut seg_t = 0.0_f32;
         if len > 0.001 {
             if let Segment::Search { search, .. } = seg {
                 // Ricerca: velocità costante, si ferma sul posto all'arrivo
                 let v = search.v.max(1.0);
                 out.push([total, v]);
-                seg_t = len / v;
-                total += seg_t;
+                total += len / v;
                 out.push([total, v]);
             } else {
                 let sp = seg.speed_profile();
@@ -131,7 +150,6 @@ pub fn speed_trace(start: [f32; 2], segments: &[Segment]) -> Vec<[f32; 2]> {
                     let r = kin_step(v, s, len, &sp, dt);
                     v = r.0; s = r.1; t += dt; guard += 1;
                 }
-                seg_t = t;
                 total += t;
                 out.push([total, v]);
             }
@@ -143,25 +161,24 @@ pub fn speed_trace(start: [f32; 2], segments: &[Segment]) -> Vec<[f32; 2]> {
             let d = heading_delta(opts.robot_heading_end, target).abs();
             if d > 1.0 {
                 out.push([total, 0.0]);
-                total += d / opts.rotation_speed.max(1.0);
+                total += d / ROTATION_SPEED_DEG_S;
                 out.push([total, 0.0]);
             }
         }
 
+        // Azioni puntuali sul nodo di arrivo: sosta fino alla fine dell'ultima azione
+        let hold = node_hold_time(node_actions, seg_i + 1);
+        if hold > 0.0 {
+            out.push([total, 0.0]);
+            total += hold;
+            out.push([total, 0.0]);
+        }
+
         match opts.action {
-            RobotAction::Wait(x) | RobotAction::ShootStop(x) => {
+            RobotAction::Wait(x) => {
                 out.push([total, 0.0]);
                 total += x;
                 out.push([total, 0.0]);
-            }
-            // Shoot+Move: se il segmento finisce prima del tempo di sparo, si ferma e finisce
-            RobotAction::ShootMove(x) => {
-                let extra = (x - seg_t).max(0.0);
-                if extra > 0.0 {
-                    out.push([total, 0.0]);
-                    total += extra;
-                    out.push([total, 0.0]);
-                }
             }
             _ => {}
         }
@@ -179,8 +196,8 @@ pub fn speed_trace(start: [f32; 2], segments: &[Segment]) -> Vec<[f32; 2]> {
 }
 
 /// Tempo totale stimato (ultimo istante di `speed_trace`).
-pub fn estimate_total_time(start: [f32; 2], segments: &[Segment]) -> f32 {
-    speed_trace(start, segments).last().map(|p| p[0]).unwrap_or(0.0)
+pub fn estimate_total_time(start: [f32; 2], segments: &[Segment], node_actions: &[NodeAction]) -> f32 {
+    speed_trace(start, segments, node_actions).last().map(|p| p[0]).unwrap_or(0.0)
 }
 
 // ════════════════════════════════════════════════════════════
@@ -191,6 +208,7 @@ impl Simulation {
     pub fn start(&mut self, segments: &[Segment]) {
         self.state     = SimState::Running;
         self.elapsed   = 0.0;
+        self.zone_hit  = false;
         self.seg_index = 0;
         self.limit     = MATCH_DURATION;
         self.begin_segment(segments);
@@ -204,10 +222,20 @@ impl Simulation {
         !matches!(self.state, SimState::Idle | SimState::Finished)
     }
 
-    /// Il robot sta sparando in questo momento (sparo da fermo / in movimento / da punto).
+    /// Il robot sta sparando in questo momento (sparo finale della ricerca o azione puntuale su un nodo).
     pub fn is_shooting(&self) -> bool {
-        matches!(self.state,
-            SimState::ShootStop { .. } | SimState::ShootMove | SimState::ShootHold { .. })
+        matches!(self.state, SimState::ShootStop { .. }) || self.node_hold_active(Mechanism::Shoot)
+    }
+
+    /// Durante la sosta su un nodo: l'azione `kind` è attiva adesso?
+    /// (ritardo ≤ tempo dall'arrivo < ritardo + durata)
+    pub fn node_hold_active(&self, kind: Mechanism) -> bool {
+        if !matches!(self.state, SimState::NodeHold { .. }) { return false; }
+        let node = self.seg_index + 1;
+        self.node_actions.iter().any(|a| {
+            a.node == node && a.kind == kind
+                && self.hold_time >= a.delay && self.hold_time < a.delay + a.secs
+        })
     }
 
     pub fn is_rotating(&self) -> bool {
@@ -238,21 +266,21 @@ impl Simulation {
             SimState::Rotating { current, .. } | SimState::Aligning { current, .. } => *current,
             // da fermo a fine segmento: l'heading è quello finale (anche dopo un Align)
             SimState::Waiting { .. } | SimState::ShootStop { .. }
-            | SimState::ShootHold { .. } => end_heading(&segments[i]),
+            | SimState::NodeHold { .. } => end_heading(&segments[i]),
             _ => interp_heading(o.robot_heading_start, o.robot_heading_end, self.t),
         };
         (pos, heading)
     }
 
-    /// Pose lungo il tragitto verso il parcheggio (solo in stato Parking).
+    /// Pose lungo il tragitto verso il parcheggio (solo in stato Parking): segue `park_route`.
     fn park_pose(&self) -> Option<([f32; 2], f32)> {
         let park = self.park.as_ref()?;
-        let dx = park.pos[0] - self.park_from[0];
-        let dy = park.pos[1] - self.park_from[1];
-        let dist = (dx * dx + dy * dy).sqrt();
+        if self.park_route.len() < 2 { return None; }
+        let cum = cumulative(&self.park_route);
+        let dist = *cum.last().unwrap_or(&0.0);
         let f = if dist > 0.001 { (self.s / dist).clamp(0.0, 1.0) } else { 1.0 };
         Some((
-            [self.park_from[0] + dx * f, self.park_from[1] + dy * f],
+            point_at_distance(&self.park_route, &cum, self.s),
             interp_heading(self.park_from_heading, park.heading, f),
         ))
     }
@@ -289,7 +317,7 @@ impl Simulation {
             if let Some(park) = self.park.clone() {
                 if park.enabled && self.elapsed >= self.limit - park.trigger_s {
                     let (pos, heading) = self.current_pose(start, segments);
-                    self.park_from = pos;
+                    self.park_route = crate::forbidden::route_avoiding(pos, park.pos);
                     self.park_from_heading = heading;
                     self.s = 0.0;
                     self.state = SimState::Parking;
@@ -298,9 +326,7 @@ impl Simulation {
         }
         if self.state == SimState::Parking {
             if let Some(park) = self.park.clone() {
-                let dx = park.pos[0] - self.park_from[0];
-                let dy = park.pos[1] - self.park_from[1];
-                let dist = (dx * dx + dy * dy).sqrt();
+                let dist = *cumulative(&self.park_route).last().unwrap_or(&0.0);
                 self.s += park.v.max(1.0) * dt;
                 if self.s >= dist {
                     self.state = SimState::Finished;
@@ -343,12 +369,14 @@ impl Simulation {
             return Some((pos, *current, false, false));
         }
 
-        // ── ShootHold: fermo su un nodo, spara (punto di sparo) ──
-        if let SimState::ShootHold { remaining } = &mut self.state {
+        // ── NodeHold: fermo su un nodo, azioni puntuali con ritardo/durata ──
+        if let SimState::NodeHold { remaining } = &mut self.state {
             *remaining -= dt;
             let done = *remaining <= 0.0;
-            let out = self.hold_pose(segments, true);
-            if done { self.run_action(segments); } // poi l'azione del segmento (wait/sparo/avanti)
+            self.hold_time += dt;
+            // intake / flywheel / sparo li accende l'app con `node_hold_active`
+            let out = self.hold_pose(segments, false);
+            if done { self.run_action(segments); } // poi l'azione del segmento (wait / avanti)
             return Some(out);
         }
 
@@ -380,21 +408,13 @@ impl Simulation {
         let cum  = cumulative(&pts);
         let seg_len = *cum.last().unwrap_or(&0.0);
 
-        // Shoot+Move vale per TUTTO il segmento su cui è impostato
-        // Shoot+Move: spara per N secondi dall'inizio del segmento
-        let shooting_move = match opts.action {
-            RobotAction::ShootMove(secs) => self.seg_time < secs,
-            _ => false,
-        };
         // Ricerca: velocità costante (None per Line/Curve)
         let search_v: Option<f32> = match seg {
             Segment::Search { search, .. } => Some(search.v.max(1.0)),
             _ => None,
         };
         let is_search = search_v.is_some();
-        self.state = if is_search { SimState::Searching }
-                     else if shooting_move { SimState::ShootMove }
-                     else { SimState::Running };
+        self.state = if is_search { SimState::Searching } else { SimState::Running };
 
         if seg_len < 0.001 {
             self.finish_segment(segments);
@@ -417,7 +437,7 @@ impl Simulation {
             let pos = *pts.last().unwrap();
             let heading = opts.robot_heading_end;
             let intake = is_search;
-            let flywheel = shooting_move;
+            let flywheel = false;
             self.finish_segment(segments);
             if self.state == SimState::Running {
                 // Recupera il tempo avanzato nel segmento successivo
@@ -430,7 +450,7 @@ impl Simulation {
         self.t = (self.s / seg_len).clamp(0.0, 1.0);
         let pos = point_at_distance(&pts, &cum, self.s);
         let heading = interp_heading(opts.robot_heading_start, opts.robot_heading_end, self.t);
-        Some((pos, heading, is_search, shooting_move))
+        Some((pos, heading, is_search, false))
     }
 
     /// Il robot è arrivato in fondo al segmento: si ferma sul posto.
@@ -441,7 +461,7 @@ impl Simulation {
             let from = opts.robot_heading_end;
             if heading_delta(from, target).abs() > 1.0 {
                 self.state = SimState::Aligning {
-                    to: target, current: from, speed: opts.rotation_speed.max(1.0),
+                    to: target, current: from, speed: ROTATION_SPEED_DEG_S,
                 };
                 return;
             }
@@ -449,14 +469,14 @@ impl Simulation {
         self.after_align(segments);
     }
 
-    /// Dopo l'eventuale align: se qui c'è un punto di sparo si ferma e spara, poi l'azione.
+    /// Dopo l'eventuale align: se sul nodo ci sono azioni puntuali (sparo / intake / flywheel
+    /// con ritardo e durata) si ferma per il tempo necessario, poi esegue l'azione del segmento.
     fn after_align(&mut self, segments: &[Segment]) {
-        let p = (self.seg_index + 1) as f32;
-        let secs = self.shoot_points.iter()
-            .find(|(q, _)| (q - p).abs() < 1e-3)
-            .map(|(_, s)| *s);
-        if let Some(secs) = secs {
-            self.state = SimState::ShootHold { remaining: secs.max(0.0) };
+        let node = self.seg_index + 1;
+        let hold = node_hold_time(&self.node_actions, node);
+        if hold > 0.0 {
+            self.hold_time = 0.0;
+            self.state = SimState::NodeHold { remaining: hold };
         } else {
             self.run_action(segments);
         }
@@ -476,16 +496,6 @@ impl Simulation {
         let opts = segments[self.seg_index].opts();
         match &opts.action {
             RobotAction::Wait(secs)      => self.state = SimState::Waiting { remaining: *secs },
-            RobotAction::ShootStop(secs) => self.state = SimState::ShootStop { remaining: *secs },
-            // Shoot+Move: se il segmento è finito prima del tempo di sparo, si ferma e finisce
-            RobotAction::ShootMove(secs) => {
-                let rem = *secs - self.seg_time;
-                if rem > 0.0 {
-                    self.state = SimState::ShootStop { remaining: rem };
-                } else {
-                    self.advance_to_next(segments);
-                }
-            }
             RobotAction::Move => self.advance_to_next(segments),
         }
     }
@@ -502,7 +512,7 @@ impl Simulation {
         let prev_end   = end_heading(&segments[prev_idx]);
         let next_start = segments[self.seg_index].opts().robot_heading_start;
         if heading_delta(prev_end, next_start).abs() > 1.0 {
-            let speed = segments[self.seg_index].opts().rotation_speed.max(1.0);
+            let speed = ROTATION_SPEED_DEG_S;
             self.state = SimState::Rotating {
                 from: prev_end, to: next_start, current: prev_end, speed,
             };

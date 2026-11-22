@@ -2,7 +2,7 @@ use eframe::egui;
 use crate::{assets, ui};
 use crate::barrier::Barrier;
 use crate::segment::{mechanism_active, Highlight, Mechanism, ParkPoint, Segment};
-use crate::simulation::{Simulation, SimState};
+use crate::simulation::{NodeAction, Simulation, SimState};
 
 #[derive(Clone, Debug)]
 pub struct FocalLine {
@@ -45,6 +45,7 @@ pub enum EditMode {
     AddSearch,    // click = punto di arrivo della ricerca palline
     AddHighlight, // trascina sul percorso per evidenziare un tratto intake/flywheel
     AddPark,      // click = punto di parcheggio d'emergenza
+    AddForbidden, // click = vertice del poligono (doppio click / 1° vertice = chiudi); trascina = sposta; dx = elimina
 }
 
 #[derive(Default, Clone, Debug)]
@@ -63,6 +64,10 @@ pub enum Dragging {
     Highlighting,
     /// Trascina il punto di parcheggio
     Park,
+    /// Sposta tutta la zona vietata n. i
+    ForbiddenZone(usize),
+    /// Sposta il vertice j della zona vietata i
+    ForbiddenVertex(usize, usize),
 }
 
 pub struct HudApp {
@@ -95,6 +100,10 @@ pub struct HudApp {
     pub was_waiting: bool,
     /// Sparo attivo in questo momento (solo indicatore; implica flywheel)
     pub shoot_active: bool,
+    /// Barra abbassata (davanti all'intake) in questo momento
+    pub bar_active: bool,
+    /// Bozza della zona vietata in disegno: vertici già piazzati (il poligono non è ancora chiuso)
+    pub forbidden_draft: Vec<[f32; 2]>,
 }
 
 impl Default for HudApp {
@@ -125,11 +134,26 @@ impl Default for HudApp {
             wait_hold_shoot:  false,
             was_waiting:      false,
             shoot_active:     false,
+            bar_active:       false,
+            forbidden_draft:  Vec::new(),
         }
     }
 }
 
 impl HudApp {
+    /// Azioni puntuali sui nodi (intake / flywheel / sparo con ritardo e durata).
+    pub fn node_actions(&self) -> Vec<NodeAction> {
+        self.highlights.iter()
+            .filter(|h| h.kind.is_point_kind() && h.to - h.from < 1e-4 && h.from >= 1.0)
+            .map(|h| NodeAction {
+                node: h.from.round() as usize,
+                kind: h.kind,
+                delay: h.delay,
+                secs: h.secs,
+            })
+            .collect()
+    }
+
     /// Rimuove un segmento e riallinea i tratti evidenziati.
     pub fn remove_segment(&mut self, i: usize) {
         if i >= self.segments.len() { return; }
@@ -168,11 +192,8 @@ impl eframe::App for HudApp {
 
         // Il simulatore deve conoscere il parcheggio d'emergenza
         self.sim.park = if self.park.enabled { Some(self.park.clone()) } else { None };
-        // Punti di sparo (from == to): il simulatore si ferma lì e spara per `secs`
-        self.sim.shoot_points = self.highlights.iter()
-            .filter(|h| h.kind == Mechanism::Shoot && h.to - h.from < 1e-4)
-            .map(|h| (h.from, h.secs))
-            .collect();
+        // Azioni puntuali sui nodi: il simulatore si ferma lì il tempo necessario
+        self.sim.node_actions = self.node_actions();
 
         // Aggiorna simulazione
         if self.sim.is_running() {
@@ -182,13 +203,18 @@ impl eframe::App for HudApp {
             if let Some((pos, heading, intake, flywheel)) = self.sim.advance(dt, start, segs) {
                 self.robot_pos       = pos;
                 self.robot_heading   = heading;
+                // il corpo del robot (non solo il suo centro) non deve toccare le zone vietate
+                if crate::forbidden::robot_hits(pos, heading) { self.sim.zone_hit = true; }
                 // Intake / flywheel / barra: dai tratti evidenziati (+ sparo/ricerca della simulazione)
                 let prev_intake = self.intake_active;
                 let prev_shoot  = self.shoot_active;
                 let gp = self.sim.seg_index as f32 + self.sim.t;
-                let mut in_a = intake   || mechanism_active(&self.highlights, Mechanism::Intake,   gp);
-                let mut fw_a = flywheel || mechanism_active(&self.highlights, Mechanism::Flywheel, gp);
+                let mut in_a = intake   || mechanism_active(&self.highlights, Mechanism::Intake,   gp)
+                    || self.sim.node_hold_active(Mechanism::Intake);
+                let mut fw_a = flywheel || mechanism_active(&self.highlights, Mechanism::Flywheel, gp)
+                    || self.sim.node_hold_active(Mechanism::Flywheel);
                 let mut low  = mechanism_active(&self.highlights, Mechanism::IntakeDown, gp);
+                let mut bar  = mechanism_active(&self.highlights, Mechanism::BarDown, gp);
                 let mut sh   = self.sim.is_shooting()
                     || mechanism_active(&self.highlights, Mechanism::Shoot, gp);
 
@@ -206,7 +232,7 @@ impl eframe::App for HudApp {
 
                 // Parcheggio d'emergenza: tutto spento
                 if self.sim.state == SimState::Parking {
-                    in_a = false; fw_a = false; low = false; sh = false;
+                    in_a = false; fw_a = false; low = false; sh = false; bar = false;
                 }
                 if sh { fw_a = true; } // lo sparo implica flywheel
 
@@ -214,12 +240,14 @@ impl eframe::App for HudApp {
                 self.flywheel_active   = fw_a;
                 self.intake_low_active = low;
                 self.shoot_active      = sh;
+                self.bar_active        = bar;
             }
             if self.sim.state == SimState::Finished {
                 self.intake_active   = false;
                 self.flywheel_active = false;
                 self.intake_low_active = false;
                 self.shoot_active = false;
+                self.bar_active = false;
             }
             ctx.request_repaint();
         }

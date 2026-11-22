@@ -74,8 +74,6 @@ pub fn to_json(app: &HudApp) -> String {
         let action = match &opts.action {
             RobotAction::Move             => r#""move""#.to_string(),
             RobotAction::Wait(secs)       => format!(r#"{{"wait":{:.2}}}"#, secs),
-            RobotAction::ShootStop(secs)  => format!(r#"{{"shoot_stop":{:.2}}}"#, secs),
-            RobotAction::ShootMove(secs)  => format!(r#"{{"shoot_move":{:.2}}}"#, secs),
         };
 
         let align = match opts.align {
@@ -90,15 +88,13 @@ pub fn to_json(app: &HudApp) -> String {
       "to":{to}{controls}{search},
       "robot_heading":{{
         "start":{:.2},
-        "end":{:.2},
-        "rotation_speed":{:.2}
+        "end":{:.2}
       }}{speed},
       "action":{action},
       "align":{align}
     }}"#,
             opts.robot_heading_start,
             opts.robot_heading_end,
-            opts.rotation_speed,
         )
     }).collect();
 
@@ -112,12 +108,14 @@ pub fn to_json(app: &HudApp) -> String {
             Mechanism::Flywheel => "flywheel",
             Mechanism::IntakeDown => "intake_down",
             Mechanism::Shoot      => "shoot",
+            Mechanism::BarDown    => "bar_down",
         };
-        // Sparo puntuale su un nodo: finito il segmento `after_segment` il robot si ferma e spara `time` s
-        if h.kind == Mechanism::Shoot && h.to - h.from < 1e-4 {
+        // Azione puntuale su un nodo: finito il segmento `after_segment` il robot si ferma;
+        // `mechanism` parte dopo `delay` secondi e dura `time` secondi
+        if h.kind.is_point_kind() && h.to - h.from < 1e-4 {
             return format!(
-                r#"    {{"type":"shoot_point","after_segment":{},"time":{:.2}}}"#,
-                (h.from.round().max(1.0) as usize) - 1, h.secs
+                r#"    {{"type":"point","mechanism":"{kind}","after_segment":{},"delay":{:.2},"time":{:.2}}}"#,
+                (h.from.round().max(1.0) as usize) - 1, h.delay, h.secs
             );
         }
         format!(
